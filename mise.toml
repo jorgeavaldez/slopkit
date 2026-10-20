@@ -1,0 +1,31 @@
+[tools]
+# Listed first so its npm comes before the one bundled with node on PATH.
+"npm:npm" = "12.2.0"
+node = "26.11.1"
+
+[tasks.install]
+description = 'Install locked dependencies'
+run = 'npm ci'
+sources = ['package.json', 'package-lock.json', 'mise.toml']
+outputs = ['node_modules/.package-lock.json']
+
+[tasks.check]
+description = 'Types, lint, tests, format and dead code'
+depends = ['install']
+run = [
+  'npm exec --no -- tsc',
+  'npm exec --no -- oxlint --type-aware --deny-warnings --report-unused-disable-directives',
+  'npm exec --no -- vitest --run',
+  'npm exec --no -- oxfmt --check',
+  'npm exec --no -- knip',
+]
+
+[tasks.build]
+description = 'Build the package into dist/'
+depends = ['install']
+run = ['rm -rf dist', 'npm exec --no -- tsc -p tsconfig.build.json']
+
+[tasks."pack:check"]
+description = 'Pack, install the tarball in a scratch app, and run the shipped conformance suite and budget from it'
+depends = ['build']
+run = 'node scripts/pack-check.ts'
