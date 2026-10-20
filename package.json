@@ -1,0 +1,159 @@
+{
+  "name": "slopkit",
+  "version": "0.1.0",
+  "description": "Opinionated standards and libraries for fast, local-first personal software: state machines, exhaustive state tables, sync, a command ledger, jobs, a guarded server, and the conformance suite that proves them",
+  "keywords": [
+    "conformance",
+    "indexeddb",
+    "local-first",
+    "pwa",
+    "sqlite",
+    "state-machine",
+    "sync"
+  ],
+  "homepage": "https://github.com/jorgeavaldez/slopkit#readme",
+  "license": "MIT",
+  "author": "Jorge Valdez",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jorgeavaldez/slopkit.git"
+  },
+  "files": [
+    "dist",
+    "RULES.md",
+    "DEPS.md"
+  ],
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "default": "./dist/schema.js"
+    },
+    "./contract": {
+      "types": "./dist/contract.d.ts",
+      "default": "./dist/contract.js"
+    },
+    "./sync": {
+      "types": "./dist/sync.d.ts",
+      "default": "./dist/sync.js"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "default": "./dist/client.js"
+    },
+    "./machine": {
+      "types": "./dist/machine.d.ts",
+      "default": "./dist/machine.js"
+    },
+    "./states": {
+      "types": "./dist/states.d.ts",
+      "default": "./dist/states.js"
+    },
+    "./money": {
+      "types": "./dist/money.d.ts",
+      "default": "./dist/money.js"
+    },
+    "./digest": {
+      "types": "./dist/digest.d.ts",
+      "default": "./dist/digest.js"
+    },
+    "./cron": {
+      "types": "./dist/cron.d.ts",
+      "default": "./dist/cron.js"
+    },
+    "./lint": {
+      "types": "./dist/lint.d.ts",
+      "default": "./dist/lint.js"
+    },
+    "./web/replica": {
+      "types": "./dist/web/replica.d.ts",
+      "default": "./dist/web/replica.js"
+    },
+    "./web/idb": {
+      "types": "./dist/web/idb.d.ts",
+      "default": "./dist/web/idb.js"
+    },
+    "./server/ledger": {
+      "types": "./dist/server/ledger.d.ts",
+      "default": "./dist/server/ledger.js"
+    },
+    "./server/jobs": {
+      "types": "./dist/server/jobs.d.ts",
+      "default": "./dist/server/jobs.js"
+    },
+    "./server/web": {
+      "types": "./dist/server/web.d.ts",
+      "default": "./dist/server/web.js"
+    },
+    "./server/auth": {
+      "types": "./dist/server/auth.d.ts",
+      "default": "./dist/server/auth.js"
+    },
+    "./server/config": {
+      "types": "./dist/server/config.d.ts",
+      "default": "./dist/server/config.js"
+    },
+    "./server/log": {
+      "types": "./dist/server/log.d.ts",
+      "default": "./dist/server/log.js"
+    },
+    "./server/secrets": {
+      "types": "./dist/server/secrets.d.ts",
+      "default": "./dist/server/secrets.js"
+    },
+    "./test/network": {
+      "types": "./dist/test/network.d.ts",
+      "default": "./dist/test/network.js"
+    },
+    "./test/oidc": {
+      "types": "./dist/test/oidc.d.ts",
+      "default": "./dist/test/oidc.js"
+    },
+    "./test/states": {
+      "types": "./dist/test/states.d.ts",
+      "default": "./dist/test/states.js"
+    },
+    "./conformance/fixtures": {
+      "types": "./dist/conformance/fixtures.d.ts",
+      "default": "./dist/conformance/fixtures.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "dependencies": {
+    "jose": "6.2.12",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/ws": "8.18.2",
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.6",
+    "knip": "6.42.1",
+    "oxfmt": "0.71.0",
+    "oxlint": "1.86.0",
+    "oxlint-tsgolint": "7.0.2004",
+    "typescript": "^7.0.2",
+    "ultracite": "8.0.1",
+    "vitest": "4.1.11"
+  },
+  "peerDependencies": {
+    "fake-indexeddb": "^6.2.6",
+    "vitest": "^4.1.11"
+  },
+  "peerDependenciesMeta": {
+    "fake-indexeddb": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "packageManager": "npm@12.2.0",
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

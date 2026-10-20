@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # The shared lint standard moves as one: ultracite's presets track oxlint's and oxfmt's rules.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      lint:
+        patterns: [ultracite, oxlint, oxlint-tsgolint, oxfmt, knip]
