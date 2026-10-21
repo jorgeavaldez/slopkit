@@ -31,9 +31,9 @@ or the kit's own tests in `test/`.
   commands it waits on. A failed write stays owed until a write the disk takes whole repairs it.
 - No paging-aware pull reply is unbounded (`server/pull`): one read transaction, keyset cursors scoped to the dataset
   and the order's version (never an offset or the anchor's current row), rows and encoded bytes within the app's caps,
-  an oversized delta answered as a paged reset, `through` only over whole order groups, and every row a receipt names in
-  the reply that carries it. A reply that can't fit is refused, never sent over the caps. A request without `page`
-  keeps the whole reply of before.
+  a delta that can't fit by itself answered as a paged reset (else the older page shrinks to the room it leaves),
+  `through` only over whole order groups, and every row a receipt names in the reply that carries it. A reply that
+  can't fit is refused, never sent over the caps. A request without `page` keeps the whole reply of before.
 - Every untrusted boundary is checked by a schema (`schema`); nothing is coerced. Money is safe-integer minor units.
 - Replicated rows carry the current revision and are never deleted (tombstones), by trigger, not habit.
 - What a screen says is decided by tables (`states`): a subject's states are a closed union and its table places
