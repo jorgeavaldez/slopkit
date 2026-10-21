@@ -211,8 +211,8 @@ and packed browser-size budgets also apply.
 
 The public vocabulary is:
 
-- `contract.Failure.kind` includes `unreadable`: a successful reply was not the JSON its response schema requires.
-  It may have acted. `server/web.Refusal` excludes `unreadable`; it is a client observation, never a server refusal.
+- `contract.Failure.kind` includes `unreadable`: a successful JSON-typed reply is malformed JSON or fails its response
+  schema. It may have acted. `server/web.Refusal` excludes `unreadable`; it is a client observation, never a server refusal.
   A failure may carry `refused?: true`, `path?: string`, and `retryAfterMs?: number`. `call` sets `refused` only for
   the kit's JSON `{ kind, message, path? }` error body whose kind matches its HTTP status; status alone never proves
   refusal. A schema 400's `path` is `Invalid.path` unchanged, e.g. `request.commands[1].command.value`, and `call`
@@ -224,8 +224,9 @@ The public vocabulary is:
   a later refusal cannot make it final. A known refusal restores each unaffected command's prior state.
 - HTTP 408 and 429 are `unavailable`, with the parsed `Retry-After` in `retryAfterMs`; retries honour both backoff and
   that floor. HTTP 404, 405 and 413 are `invalid` without a command path (incompatible), logged. Proxy 403 and 409
-  without a matching kit body keep their status classification but are not final. A successful HTML, malformed JSON
-  or schema-bad JSON reply is `unreadable`, not a request refusal. Redirects still mean signed out.
+  without a matching kit body keep their status classification but are not final. A successful JSON-typed reply with
+  malformed or schema-bad JSON is `unreadable`, not a request refusal. A successful HTML login page and redirects mean
+  `signed-out`: the identity proxy kept the request from the origin, and the remedy is signing in, not a reload.
 - `sync.PUSH_BYTES` is 49,152 (48 KiB); `Spec.pushBytes` overrides it. Both it and `pushMax` are positive safe integers.
   The byte count is UTF-8 `JSON.stringify` of the **whole** push request that `call` sends, envelope included. An app
   gives its push server the same bound (`serveWeb.bodyLimit`), not a character limit. Oldest-first packing stops at
