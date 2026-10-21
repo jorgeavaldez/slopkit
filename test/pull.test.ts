@@ -59,6 +59,7 @@ const pullRoute = endpoint(
       commands: array(
         object(
           {
+            client: string(),
             id: number({ integer: true, min: 1 }),
             revision: number({ integer: true }),
             note: string(),
@@ -206,7 +207,10 @@ function open(path: string, limits: PullLimits) {
         .map(read),
     }),
     receipts: {
-      read: (since, client: string) => ledger.receipts(PRINCIPAL, client, since),
+      read: (ask, client: string) =>
+        ask.commands === undefined
+          ? ledger.receipts(PRINCIPAL, client, ask.since).map((each) => ({ ...each, client }))
+          : ledger.receiptsOf(PRINCIPAL, ask.commands),
       names: (each) => [each.receipt.note],
     },
     limits,
@@ -217,6 +221,7 @@ function open(path: string, limits: PullLimits) {
       notes: pulled.rows,
       settings: pulled.unpaged.settings,
       commands: pulled.receipts.map((each) => ({
+        client: each.client,
         id: each.id,
         revision: each.revision,
         note: each.receipt.note,

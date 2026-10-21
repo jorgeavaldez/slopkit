@@ -110,7 +110,10 @@ const pulls = createPull({
   paged: { table: "transactions", order: ["date", "id"], version: 1, live: "deleted = 0", read: toTransaction,
     through: ([date]) => String(date) },
   unpaged: (since) => ({ accounts: store.accounts(since) }), // whole on every reset
-  receipts: { read: (since, viewer: Viewer) => ledger.receipts(viewer.principal, viewer.client, since),
+  // the commands the page names (any of its pages'), or an old page's own receipts since `since`
+  receipts: { read: ({ since, commands }, viewer: Viewer) => commands === undefined
+      ? ledger.receipts(viewer.principal, viewer.client, since).map((each) => ({ ...each, client: viewer.client }))
+      : ledger.receiptsOf(viewer.principal, commands),
     names: (each) => [each.receipt.transaction] },
   limits: { firstRows: 200, pageRows: 2000, maxRows: 5000, maxBytes: 2_000_000 },
   // your endpoint's reply: the caps measure its json

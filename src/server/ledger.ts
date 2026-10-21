@@ -297,6 +297,35 @@ export class Ledger<Receipt> {
       });
   }
 
+  /**
+   * The receipts of these commands (any of the principal's clients, so an earlier page's too), in the order asked: for
+   * a pull that names the commands it still waits on. One with no receipt yet (or retired) is left out.
+   */
+  receiptsOf(
+    principal: string,
+    keys: readonly { client: string; id: number }[]
+  ): { client: string; id: number; receipt: Receipt; revision: number }[] {
+    const { db, decode } = this.options;
+
+    const find = db.prepare(
+      "select outcome, revision from commands where principal = ? and client = ? and id = ? and state = 'done'"
+    );
+
+    return keys.flatMap(({ client, id }) => {
+      const row = find.get(principal, client, id);
+
+      if (row === undefined) {
+        return [];
+      }
+
+      if (typeof row.outcome !== "string") {
+        throw new TypeError("Corrupt row in commands.outcome");
+      }
+
+      return [{ client, id, receipt: decode(row.outcome), revision: Number(row.revision) }];
+    });
+  }
+
   /** Commands accepted longer than `ms` ago and still unfinished: a stuck effect, for the invariant probe. */
   stuck(ms: number): number {
     const before = new Date(Date.now() - ms).toISOString();

@@ -496,7 +496,12 @@ export function indexedReplica<T, P, S, C, O>(options: {
           throw new Error("the replica has no dataset");
         }
 
-        return { dataset: now.dataset, revision: now.revision };
+        // A delta under the disk's own history leaves out rows of this page's copy: said, so a failed write stays owed.
+        return {
+          dataset: now.dataset,
+          revision: now.revision,
+          ...(plan === "delta" && stored.history.kind === "partial" ? { whole: false } : {}),
+        };
       } catch (error) {
         await done.catch(() => undefined);
         throw error;

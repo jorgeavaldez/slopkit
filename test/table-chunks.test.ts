@@ -69,3 +69,17 @@ test("chunk after chunk, a table reads back exactly the rows applied, and earlie
     expect(sorted(each.tables.rows)).toStrictEqual(each.rows);
   }
 });
+
+// A table read as a Map: `forEach` calls back with the receiver it is given, as Map's does.
+test("forEach passes its receiver on", () => {
+  const base = new Map(["a", "b", "c", "d"].map((id) => [id, row(id, 1, 1)]));
+  const tables = lens.apply({ rows: base }, { rows: [row("e", 1, 2)] }, false);
+  const context = { sum: 0 };
+
+  // oxlint-disable-next-line unicorn/no-array-for-each, unicorn/no-array-method-this-argument -- a Map's forEach and its receiver are what is checked
+  tables.rows.forEach(function add(this: typeof context, item) {
+    this.sum += item.value;
+  }, context);
+
+  expect(context.sum).toBe(5);
+});

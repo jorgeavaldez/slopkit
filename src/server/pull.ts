@@ -16,9 +16,12 @@
  * - **Every paging-aware reply is bounded** by `limits`: the history's rows, the other tables' and the receipts' rows
  *   together within `maxRows`, the reply as `respond` builds it within `maxBytes` encoded. A delta that doesn't fit in
  *   rows with a full page beside it, or doesn't fit in bytes, is answered as a paged reset; an older page shrinks to
- *   fit its bytes. The caps must hold the other tables, the receipts and one row of history.
+ *   fit its bytes. A reset carries one row of history at least, then as many receipts as fit, then more rows; one
+ *   that can't fit even so (the other tables alone are over the caps) is never sent: `pull` throws, a server fault
+ *   the page sees as unavailable and retries.
  * - **Receipts carry their rows.** A row a receipt names is in the reply that carries the receipt, even below the page,
- *   so a command settles only on a copy that holds its effects.
+ *   so a command settles only on a copy that holds its effects. A paging client names the commands it waits on (any of
+ *   its pages', at most a push's worth); a receipt left out for room is asked for again by its next pull.
  * - **Old clients keep the old protocol.** A request without `page` gets the whole reply as before: everything on a
  *   reset, the changes otherwise, without page metadata and unbounded.
  *
@@ -37,8 +40,19 @@ import type { Page } from "../sync.ts";
 /** The caps of a paging-aware reply: rows of the first and later pages, and the whole reply in rows and bytes. */
 export type PullLimits = { firstRows: number; pageRows: number; maxRows: number; maxBytes: number };
 
-/** What `pull` reads of a request: the copy's dataset and revision, and the older page it wants. */
-export type PullAsk = { dataset: string | null; since: number; page?: string | null };
+/** A command by the page that sent it and its number. */
+export type CommandRef = { client: string; id: number };
+
+/**
+ * What `pull` reads of a request: the copy's dataset and revision, the older page it wants, and the commands it still
+ * waits on (any of its pages', at most a push's worth).
+ */
+export type PullAsk = {
+  dataset: string | null;
+  since: number;
+  page?: string | null;
+  commands?: readonly CommandRef[];
+};
 
 /** A reply before the app shapes it: the history's rows, the other tables, the receipts and the page. */
 export type Pulled<R, U, Rc> = {
@@ -58,10 +72,30 @@ type Row = Record<string, SQLOutputValue>;
 
 const marks = (columns: readonly string[]) => columns.map(() => "?").join(", ");
 
-const count = (tables: Record<string, readonly unknown[]>) =>
+const sizeOf = (tables: Record<string, readonly unknown[]>) =>
   Object.values(tables).reduce((sum, rows) => sum + rows.length, 0);
 
 const tally = (row: Row | undefined) => Number(row?.n ?? 0);
+
+/** The largest whole number from `low` to `high` that `fits`, or undefined (`fits` holds for every one below it). */
+function largest(low: number, high: number, fits: (at: number) => boolean): number | undefined {
+  let found: number | undefined;
+  let from = low;
+  let to = high;
+
+  while (from <= to) {
+    const at = Math.floor((from + to) / 2);
+
+    if (fits(at)) {
+      found = at;
+      from = at + 1;
+    } else {
+      to = at - 1;
+    }
+  }
+
+  return found;
+}
 
 /** A row's values in these order columns, which are never null: what a cursor holds. */
 const values = (row: Row, columns: readonly string[]): (string | number)[] =>
@@ -98,8 +132,16 @@ export type PullOptions<R, U extends Record<string, readonly unknown[]>, Rc, Cal
   /** The other tables' rows changed after `since`, or every live row for 0: always whole on a reset. */
   unpaged: (since: number) => U;
   /** The caller's receipts stamped after `since`, and the history rows (by key) each one names. */
+  /**
+   * The receipts a reply carries, and the history rows (by key) each one names. With `commands` (a paging client's),
+   * those commands' receipts, scoped to the caller's principal; without, the caller's client's receipts stamped after
+   * `since`, as before.
+   */
   receipts: {
-    read: (since: number, caller: Caller) => readonly Rc[];
+    read: (
+      ask: { since: number; commands?: readonly CommandRef[] },
+      caller: Caller
+    ) => readonly Rc[];
     names: (receipt: Rc) => readonly (string | number)[];
   };
   limits: PullLimits;
@@ -241,92 +283,85 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
       });
     }
 
-    /** The rows the receipts name, once each, as the store holds them now. */
-    const named = (list: readonly Rc[]) => {
-      const keys = new Set(list.flatMap((each) => options.receipts.names(each)));
-
-      return [...keys].flatMap((each) => sql.named.all(each));
-    };
-
     /**
-     * The reply with `size` rows of `page` (fetched with one row more, to know if older ones are left), and `extra`
-     * history rows beside them; the largest size from `least` up to `most` whose reply fits its bytes.
+     * A reply: `size` rows of `page` (fetched with one row more, to know if older ones are left), the first `count` of
+     * `kept` receipts with the rows they name, and `extra` history rows beside them; once each, as the store holds
+     * them now. Says whether it fits the caps, and how many rows it carries.
      */
-    const fit = (
-      fixed: { reset: boolean; from: string | null; unpaged: U; receipts: Rc[] },
+    const reply = (
+      fixed: { reset: boolean; from: string | null; unpaged: U },
       page: Row[],
-      extra: Row[],
-      least: number,
-      most: number
+      kept: readonly Rc[],
+      extra: Row[]
     ) => {
-      const build = (size: number) => {
-        const rows = page.slice(0, size);
-        const keys = new Set(rows.map((row) => row[key]));
+      const named = kept.map((each) =>
+        options.receipts.names(each).flatMap((name) => sql.named.all(name))
+      );
 
-        return answer({
+      return (size: number, count = kept.length) => {
+        const rows = new Map<SQLOutputValue | undefined, Row>();
+
+        for (const row of [...page.slice(0, size), ...extra, ...named.slice(0, count).flat()]) {
+          rows.set(row[key], rows.get(row[key]) ?? row);
+        }
+
+        const made = answer({
           ...base,
           ...fixed,
-          rows: [...rows, ...extra.filter((row) => !keys.has(row[key]))].map(paged.read),
-          page: place(dataset, fixed.from, rows.at(-1), page.length > size),
+          rows: [...rows.values()].map(paged.read),
+          receipts: kept.slice(0, count),
+          page: place(dataset, fixed.from, page[size - 1], page.length > size),
         });
+
+        const carried = rows.size + sizeOf(fixed.unpaged);
+
+        return { made, carried, fits: carried <= limits.maxRows && made.bytes <= limits.maxBytes };
       };
-
-      let low = least;
-      let high = most;
-      let best: ReturnType<typeof build> | undefined;
-
-      while (low <= high) {
-        const size = Math.floor((low + high) / 2);
-        const made = build(size);
-
-        if (made.bytes <= limits.maxBytes) {
-          best = made;
-          low = size + 1;
-        } else {
-          high = size - 1;
-        }
-      }
-
-      return { best, build };
     };
 
     if (!reset) {
-      const changed = sql.changes.all(since);
-      const keys = new Set(changed.map((row) => row[key]));
       const unpaged = options.unpaged(since);
-      const kept = [...receipts(since)];
-      const extra = [...changed, ...named(kept).filter((row) => !keys.has(row[key]))];
       const room = cursor === null ? 0 : limits.pageRows;
+      const page = cursor === null ? [] : sql.older.all(...cursor, room + 1);
+      const from = request.page;
 
-      if (extra.length + count(unpaged) + room <= limits.maxRows) {
-        const page = cursor === null ? [] : sql.older.all(...cursor, room + 1);
-        const most = Math.min(room, page.length);
+      const build = reply(
+        { reset: false, from, unpaged },
+        page,
+        receipts(since),
+        sql.changes.all(since)
+      );
 
-        const { best } = fit(
-          { reset: false, from: request.page, unpaged, receipts: kept },
-          page,
-          extra,
-          Math.min(1, most),
-          most
-        );
+      const most = Math.min(room, page.length);
 
-        if (best !== undefined) {
-          return best;
+      // The changes and every receipt's rows fit beside a full page, or the copy starts over; the page then shrinks to
+      // fit the bytes, keeping one row at least.
+      if (build(0).carried + room <= limits.maxRows) {
+        const size = largest(Math.min(1, most), most, (at) => build(at).fits);
+
+        if (size !== undefined) {
+          return build(size).made;
         }
       }
     }
 
-    // Everything, from the newest page: as many of the first rows as fit beside the other tables and the receipts.
-    const unpaged = options.unpaged(0);
-    const kept = [...receipts(0)];
-    const extra = named(kept);
+    // Everything, from the newest page: one row of it at least, then as many receipts (with their rows) as fit, then
+    // as many more of the first rows. A receipt left out is asked for again by the next pull.
+    const kept = receipts(0);
     const page = sql.top.all(limits.firstRows + 1);
-    const room = limits.maxRows - count(unpaged) - extra.length;
-    const most = Math.min(page.length, Math.max(1, Math.min(limits.firstRows, room)));
-    const fixed = { reset: true, from: null, unpaged, receipts: kept };
-    const { best, build } = fit(fixed, page, extra, Math.min(1, most), most);
+    const least = Math.min(1, page.length);
+    const build = reply({ reset: true, from: null, unpaged: options.unpaged(0) }, page, kept, []);
+    const count = largest(0, kept.length, (at) => build(least, at).fits);
 
-    return best ?? build(Math.min(1, most));
+    if (count === undefined) {
+      throw new Error(
+        `pull: the reply can't fit its caps (${limits.maxRows} rows, ${limits.maxBytes} bytes), even with one row of history`
+      );
+    }
+
+    const most = Math.min(limits.firstRows, page.length);
+
+    return build(largest(least, most, (at) => build(at, count).fits) ?? least, count).made;
   }
 
   /** The reply to one request, its encoded size, and what it carries before `respond` shaped it. */
@@ -341,7 +376,12 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
     }
 
     try {
-      return assemble(request, (since) => options.receipts.read(since, caller));
+      return assemble(request, (since) =>
+        options.receipts.read(
+          request.commands === undefined ? { since } : { since, commands: request.commands },
+          caller
+        )
+      );
     } finally {
       if (own) {
         db.exec("commit");

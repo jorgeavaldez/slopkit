@@ -30,8 +30,11 @@ export class Replaced extends Error {
 export type StoragePort<T, S, C, O> = {
   /** The replica and the outbox; `unreadable` counts kept commands this version can't read (left on disk). */
   load: () => Promise<{ replica: Replica<T, S>; commands: Pending<C, O>[]; unreadable: number }>;
-  /** Commit a patch, decided against the disk inside its transaction; returns what the disk now holds. */
-  commit: (commit: Commit<T, S>) => Promise<{ dataset: string; revision: number }>;
+  /**
+   * Commit a patch, decided against the disk inside its transaction; returns what the disk now holds, and `whole:
+   * false` when it took the patch as a delta under its own history (so it lacks rows of this page's copy).
+   */
+  commit: (commit: Commit<T, S>) => Promise<{ dataset: string; revision: number; whole?: boolean }>;
   /** Write one command (an intent, or its outcome) under its key. */
   keep: (pending: Pending<C, O>) => Promise<void>;
   drop: (keys: { client: string; id: number }[]) => Promise<void>;
@@ -48,6 +51,8 @@ export type NetworkPort<P, S, C, O> = {
      * for an old server's whole reply.
      */
     page?: string | null;
+    /** Commands waiting on an outcome or on their effects, any page's: their receipts come with the rows they name. */
+    commands?: { client: string; id: number }[];
   }) => Promise<Result<{ patch: Patch<P, S>; receipts: Receipt<O>[] }>>;
   push: (request: {
     client: string;
@@ -122,7 +127,10 @@ export function createClient<T, P, S, C, O>(options: {
               dataset: effect.dataset,
               since,
               verify: effect.verify,
-              ...(effect.page === undefined ? {} : { page: effect.page }),
+              // An old server's whole copy is asked as an old client asks it: with neither.
+              ...(effect.page === undefined
+                ? {}
+                : { page: effect.page, commands: effect.commands }),
             })
             .then(
               (result): M =>
