@@ -7,7 +7,9 @@
  *   replica instead, so the checkpoint never covers rows the disk doesn't have.
  * - Every write checks the database's generation, read at load: after a forget in another tab this page's writes
  *   fail as `Replaced` instead of bringing the forgotten copy back.
- * - The outbox is written per command, never replaced whole, so tabs can't overwrite each other's intents.
+ * - The outbox is written per command, never replaced whole, so tabs can't overwrite each other's intents. A new
+ *   command is admitted inside its own write's transaction, from the store's count, so every tab shares one bound;
+ *   a kept one always updates, and nothing kept is dropped for room.
  * - Rows are read back only under the row shapes that wrote them (each table's name and schema `shape`, kept with the
  *   checkpoint): any change to a table or its schema starts the rows over, with no number to bump by hand. The next
  *   commit then writes the whole replica, so the disk is repaired, not just the memory. Rows that don't parse are
@@ -28,7 +30,7 @@ import { Replaced } from "../client.ts";
 import type { StoragePort } from "../client.ts";
 import { check, literal, nullable, number, object, string } from "../schema.ts";
 import type { Schema } from "../schema.ts";
-import { commitPlan } from "../sync.ts";
+import { commitPlan, OUTBOX_MAX } from "../sync.ts";
 import type { History, Lens, Op, Pending, Replica } from "../sync.ts";
 import { committed, openDatabase, request } from "./idb.ts";
 
@@ -508,16 +510,41 @@ export function indexedReplica<T, P, S, C, O>(options: {
       }
     },
 
-    async keep(pending) {
+    async keep(pending, max = OUTBOX_MAX) {
       const database = await db();
       const transaction = database.transaction(["meta", "outbox"], "readwrite");
       const done = committed(transaction);
+      const outbox = transaction.objectStore("outbox");
+      const key = [pending.client, pending.id];
 
       try {
         await guard(transaction);
-        transaction.objectStore("outbox").put(pending, [pending.client, pending.id]);
+
+        // Admission is decided here, from the store's own count, so every tab shares one bound. A kept key always
+        // updates; records already past the bound (an older release, a larger one) stay, and keep new ones out.
+        if (
+          (await request<number>(outbox.count(key))) === 0 &&
+          (await request<number>(outbox.count())) >= max
+        ) {
+          const kept = await request<unknown[]>(outbox.getAll());
+
+          // Unreadable records take room too: counted as waiting, since what they hold is unknown.
+          const finished = kept.filter((each) => {
+            const parsed = check(options.pending, each);
+
+            return parsed.ok && parsed.value.state.kind === "done";
+          }).length;
+
+          await done;
+
+          return { kind: "full", waiting: kept.length - finished, finished, max };
+        }
+
+        outbox.put(pending, key);
         options.interfere?.("keep", transaction);
         await done;
+
+        return undefined;
       } catch (error) {
         await done.catch(() => undefined);
         throw error;

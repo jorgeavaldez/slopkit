@@ -98,6 +98,12 @@ push handlers return per-command outcomes as ledger receipts. once any command i
 an `invalid`, `forbidden` or `conflict` refusal for the whole request: a refusal proves only that attempt did not act,
 not that an earlier delivery did not. request schemas are checked before the handler runs.
 
+a push is at most `PUSH_BYTES` (48 KiB) of UTF-8 json, within `serveWeb`'s default `bodyLimit` (64 KiB): never set
+`bodyLimit` below the page's `pushBytes`. the outbox admits at most `OUTBOX_MAX` (500) commands across tabs: place
+`deriveOutboxState(model)` in its own table (`waiting` needs a connection, `finished` needs dismissing), and a
+command that is `unknown` and `parked` as needing attention. a `Failure` of kind `unreadable` is a reply the page
+couldn't read: it may have acted.
+
 ### sync in pages
 
 a device with no copy draws its newest rows after one round trip, whatever the history's size, then pulls older pages

@@ -34,6 +34,16 @@
  *   to load or keep is said (the page goes on from the server meanwhile), and its late answer still counts: a slow
  *   write is not a failed one.
  * - **An intent belongs to the dataset it was made against**: the server refuses it against a replacement.
+ * - **A refusal proves only that attempt didn't act.** Only the kit's own error body is final; anything else may have
+ *   acted and leaves the command unknown, kept so. A command an attempt of which may have acted never becomes a final
+ *   failure: a refusal naming it parks it (never sent again, still named in pulls, done when a receipt comes). A schema
+ *   refusal naming one command of a push is that command's alone; the rest return to what they were and go again.
+ * - **A push fits the server's bounds**: at most `pushMax` commands and `pushBytes` bytes, oldest first, stopping at
+ *   the first command that doesn't fit. One too large even alone is answered at the tap and never kept; one already
+ *   kept is refused (or parked) and passed over, so it never strands the rest.
+ * - **The outbox is bounded across tabs.** The store admits a new command inside its own write transaction, from its
+ *   own count; one it has no room for is answered and never retained. Kept commands always update and are never
+ *   dropped for room.
  */
 import type { Failure } from "./contract.ts";
 import { unreachable } from "./machine.ts";
@@ -309,7 +319,12 @@ export type CommandState<O> =
   | { kind: "saving" }
   | { kind: "queued" }
   | { kind: "sending" }
-  | { kind: "unknown"; failure: string }
+  /**
+   * An attempt's outcome was lost: it may have acted. `parked`: the server refused it by name since, which proves only
+   * that attempt didn't act, so it is never sent again and waits on a pull to bring the receipt an earlier one left; it
+   * needs the person's attention meanwhile.
+   */
+  | { kind: "unknown"; failure: string; parked?: true }
   | { kind: "done"; outcome: O; revision: number };
 
 export type Pending<C, O> = {
@@ -335,6 +350,17 @@ export type Connection =
   | { kind: "offline"; failure: string }
   | { kind: "signed-out" }
   | { kind: "incompatible"; failure: string };
+
+/**
+ * The outbox's room, as a closed subject for the app's state table: full when it holds `max` commands. `waiting`
+ * (unsent or unknown) needs a connection; `finished` (done, kept until dismissed) needs the person to dismiss them.
+ */
+export type OutboxState =
+  | { kind: "ok" }
+  | { kind: "full"; waiting: number; finished: number; max: number };
+
+/** The store's answer to a new command it had no room for: its own counts, across every tab. */
+export type OutboxFull = Extract<OutboxState, { kind: "full" }>;
 
 /** This device's copy: fine, failing (writes are retried), or forgotten under this page by another tab. */
 export type Storage = { kind: "ok" } | { kind: "failed"; reason: string } | { kind: "replaced" };
@@ -375,8 +401,20 @@ export type Model<T, S, C, O> = {
     | { kind: "pulling"; since: number; failures: number };
   push:
     | { kind: "idle"; nextAt: number; failures: number }
-    | { kind: "pushing"; client: string; ids: readonly number[]; failures: number };
+    | {
+        kind: "pushing";
+        client: string;
+        ids: readonly number[];
+        /** Each command's state before this attempt, by position in `ids`: what a refusal restores. */
+        was: readonly CommandState<O>[];
+        failures: number;
+      };
   commands: readonly Pending<C, O>[];
+  /**
+   * The most commands the outbox admits, and the store's counts when it last refused one for room (it is shared with
+   * other tabs, whose commands this page doesn't hold); cleared once one is admitted or this page drops some.
+   */
+  outbox: { max: number; full: OutboxFull | null };
   /** Commands (`client:id`) whose receipt came in a pull reply this copy applied, so with the rows it names. */
   carried: ReadonlySet<string>;
   /** Commands an earlier page kept that this version can't read: left on disk, and said. */
@@ -421,6 +459,8 @@ export type Msg<T, P, S, C, O> =
   | { type: "commitFailed"; reason: string; replaced: boolean; now: number }
   | { type: "kept"; client: string; id: number; now: number }
   | { type: "keepFailed"; client: string; id: number; reason: string; now: number }
+  /** The outbox had no room for a new command: it was not kept. */
+  | ({ type: "full"; client: string; id: number; now: number } & Omit<OutboxFull, "kind">)
   /** Finished commands left the outbox (`failure` if not: they fade again on the next load). */
   | { type: "dropped"; failure: string | null; now: number }
   | { type: "socket"; open: boolean; now: number }
@@ -471,7 +511,8 @@ export type Effect<T, S, C, O> =
       commands: { id: number; command: C }[];
     }
   | ({ kind: "commit" } & Commit<T, S>)
-  | { kind: "keep"; pending: Pending<C, O> }
+  /** Keep a command: a new one only while the outbox holds fewer than `max` (decided by the store). */
+  | { kind: "keep"; pending: Pending<C, O>; max: number }
   | { kind: "drop"; keys: { client: string; id: number }[] }
   | { kind: "check"; replica: Replica<T, S>; checksum: string }
   /** A command reached its outcome (for the app: open a window, close one). */
@@ -502,6 +543,13 @@ export type Spec<T, P, S, C, O> = {
   resolved?: (pending: Pending<C, O>, model: Model<T, S, C, O>) => boolean;
   /** The most commands one push carries: the push endpoint's own bound. Default `PUSH_MAX`. */
   pushMax?: number;
+  /**
+   * The most UTF-8 bytes of one push request, encoded whole: the push endpoint's body limit (`serveWeb.bodyLimit`)
+   * must be at least this. Default `PUSH_BYTES`.
+   */
+  pushBytes?: number;
+  /** The most commands the device's outbox admits, shared by every tab. Default `OUTBOX_MAX`. */
+  outboxMax?: number;
 };
 
 /** The socket must be heard this often (the server pokes every 20 s); quieter, the page polls. */
@@ -517,8 +565,56 @@ export const STORAGE_DEADLINE_MS = 3000;
 /** Commands per push unless the spec says otherwise; the rest wait for the next push. */
 export const PUSH_MAX = 50;
 
+/** UTF-8 bytes of one push request unless the spec says otherwise (48 KiB). */
+export const PUSH_BYTES = 49_152;
+
+/** Commands the outbox admits unless the spec says otherwise; updates to kept ones always are. */
+export const OUTBOX_MAX = 500;
+
 /** Settled commands stay drawn this long. */
 export const DONE_KEEP_MS = 60_000;
+
+/** A string's length in UTF-8 bytes, as it goes on the wire. */
+function utf8(text: string): number {
+  let bytes = 0;
+
+  // By code point: a surrogate pair is one character of four bytes, a lone surrogate encodes as three.
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    bytes += code < 0x80 ? 1 : code < 0x8_00 ? 2 : code < 0x1_00_00 ? 3 : 4;
+  }
+
+  return bytes;
+}
+
+/** A push's bytes as `call` encodes it: this envelope, each command's bytes, and a comma between commands. */
+const envelope = (client: string, dataset: string | null, since: number) =>
+  utf8(JSON.stringify({ client, dataset, since, commands: [] }));
+
+const bytesOf = (pending: { id: number; command: unknown }) =>
+  utf8(JSON.stringify({ id: pending.id, command: pending.command }));
+
+/**
+ * Where the outbox stands: full once it holds `max` commands, by this page's count or, failing that, by the store's
+ * last refusal (other tabs' commands count too). Unreadable kept commands take room as well.
+ */
+export function deriveOutboxState<T, S, C, O>(model: Model<T, S, C, O>): OutboxState {
+  const finished = model.commands.filter((each) => each.state.kind === "done").length;
+  const waiting = model.commands.length - finished + model.unreadable;
+
+  if (waiting + finished >= model.outbox.max) {
+    return { kind: "full", waiting, finished, max: model.outbox.max };
+  }
+
+  return model.outbox.full ?? { kind: "ok" };
+}
+
+/** The command a push's schema path names (`request.commands[2].command.value` names 2), if it names one. */
+function commandAt(path: string | undefined): number | undefined {
+  const found = /^request\.commands\[(\d+)\](?:$|[.[])/.exec(path ?? "");
+
+  return found?.[1] === undefined ? undefined : Number(found[1]);
+}
 
 /** Whether the server can be asked now. */
 export function reachable(connection: Connection): boolean {
@@ -680,7 +776,8 @@ function failedConnection(connection: Connection, failure: Failure): Connection 
       return { kind: "signed-out" };
     }
 
-    case "invalid": {
+    case "invalid":
+    case "unreadable": {
       return { kind: "incompatible", failure: failure.message };
     }
 
@@ -701,8 +798,17 @@ function failedConnection(connection: Connection, failure: Failure): Connection 
 export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
   const pushMax = spec.pushMax ?? PUSH_MAX;
 
-  if (!Number.isSafeInteger(pushMax) || pushMax < 1) {
-    throw new Error(`sync: pushMax must be a positive integer, got ${pushMax}`);
+  const pushBytes = spec.pushBytes ?? PUSH_BYTES;
+  const outboxMax = spec.outboxMax ?? OUTBOX_MAX;
+
+  for (const [name, value] of [
+    ["pushMax", pushMax],
+    ["pushBytes", pushBytes],
+    ["outboxMax", outboxMax],
+  ] as const) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error(`sync: ${name} must be a positive integer, got ${value}`);
+    }
   }
 
   type M = Model<T, S, C, O>;
@@ -743,6 +849,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       pull: { kind: "idle", nextAt: now, failures: 0 },
       push: { kind: "idle", nextAt: now, failures: 0 },
       commands: [],
+      outbox: { max: outboxMax, full: null },
       carried: new Set(),
       unreadable: 0,
       visible: true,
@@ -813,6 +920,56 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
   const ready = (model: M): boolean => model.boot.kind === "ready";
 
+  const keep = (pending: Pending<C, O>): E => ({ kind: "keep", pending, max: outboxMax });
+
+  /** Waiting to be sent: queued, or unknown and not parked (asked again under its key). */
+  const sendable = (each: Pending<C, O>) =>
+    each.state.kind === "queued" || (each.state.kind === "unknown" && each.state.parked !== true);
+
+  const tooLarge = (bytes: number) =>
+    `this is too large to send: ${bytes} bytes, where a push holds at most ${pushBytes}`;
+
+  /** A command that failed on the page: done with that outcome, never sent, and its kept intent dropped. */
+  function fail(pending: Pending<C, O>, message: string, now: number): Pending<C, O> {
+    return {
+      ...pending,
+      at: now,
+      state: { kind: "done", outcome: spec.refused(pending.command, message), revision: 0 },
+    };
+  }
+
+  /**
+   * A command the server refused by name, or one too large to send: final if no attempt of it may have acted; else
+   * parked, since a refusal proves only that attempt didn't act. Kept either way, and passed over by every push.
+   */
+  function refuse(
+    pending: Pending<C, O>,
+    doubt: boolean,
+    message: string,
+    now: number,
+    effects: E[]
+  ): Pending<C, O> {
+    if (doubt) {
+      const parked: Pending<C, O> = {
+        ...pending,
+        state: { kind: "unknown", failure: message, parked: true },
+      };
+
+      effects.push(keep(parked), {
+        kind: "telemetry",
+        name: "command.parked",
+        attributes: { reason: message },
+      });
+
+      return parked;
+    }
+
+    const done = fail(pending, message, now);
+    effects.push(keep(done), { kind: "answered", pending: done });
+
+    return done;
+  }
+
   /** Start what is due: the obligations are read off the model after every message, never remembered. */
   function schedule(model: M, effects: E[]): Step {
     let next = model;
@@ -875,48 +1032,76 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
     }
 
     if (next.push.kind === "idle" && now >= next.push.nextAt && reachable(next.connection)) {
-      const first = next.commands.find(
-        (each) => each.state.kind === "queued" || each.state.kind === "unknown"
-      );
+      const tapped = (each: Pending<C, O>) => each.since ?? next.replica.revision;
+      let first = next.commands.find(sendable);
+
+      // A kept command too large to send even alone (an older release kept it, or the bound was lowered) is refused,
+      // or parked if an attempt may have acted, and passed over: it never strands the commands behind it.
+      while (first !== undefined) {
+        const alone = envelope(first.client, first.dataset, tapped(first)) + bytesOf(first);
+
+        if (alone <= pushBytes) {
+          break;
+        }
+
+        const large = first;
+        const told: E[] = [];
+        const withdrawn = refuse(large, large.state.kind === "unknown", tooLarge(alone), now, told);
+        out.push(...told);
+        next = {
+          ...next,
+          commands: next.commands.map((each) => (each === large ? withdrawn : each)),
+        };
+        first = next.commands.find(sendable);
+      }
 
       if (first !== undefined) {
         // One push per client, dataset and tapped-against revision: the server judges each by what it was made on.
-        // At most `pushMax`, oldest first; the rest go in the next push.
-        const tapped = (each: Pending<C, O>) => each.since ?? next.replica.revision;
+        // Oldest first, at most `pushMax` commands and `pushBytes` bytes: it stops at the first command that doesn't
+        // fit, never skipping ahead to a smaller one, and the rest go in the next push.
+        const lead = first;
+        const batch: Pending<C, O>[] = [];
+        let bytes = envelope(lead.client, lead.dataset, tapped(lead));
 
-        const ids = new Set(
-          next.commands
-            .filter(
-              (each) =>
-                each.client === first.client &&
-                each.dataset === first.dataset &&
-                tapped(each) === tapped(first) &&
-                (each.state.kind === "queued" || each.state.kind === "unknown")
-            )
-            .slice(0, pushMax)
-            .map((each) => each.id)
-        );
+        for (const each of next.commands) {
+          if (
+            each.client !== lead.client ||
+            each.dataset !== lead.dataset ||
+            tapped(each) !== tapped(lead) ||
+            !sendable(each)
+          ) {
+            continue;
+          }
 
-        const mine = (each: Pending<C, O>) => each.client === first.client && ids.has(each.id);
+          const size = bytesOf(each) + (batch.length > 0 ? 1 : 0);
+
+          if (batch.length >= pushMax || bytes + size > pushBytes) {
+            break;
+          }
+
+          bytes += size;
+          batch.push(each);
+        }
+
+        const sent = new Set(batch);
         out.push({
           kind: "push",
-          client: first.client,
-          dataset: first.dataset,
-          since: tapped(first),
-          commands: next.commands
-            .filter(mine)
-            .map((each) => ({ id: each.id, command: each.command })),
+          client: lead.client,
+          dataset: lead.dataset,
+          since: tapped(lead),
+          commands: batch.map((each) => ({ id: each.id, command: each.command })),
         });
         next = {
           ...next,
           push: {
             kind: "pushing",
-            client: first.client,
-            ids: [...ids],
+            client: lead.client,
+            ids: batch.map((each) => each.id),
+            was: batch.map((each) => each.state),
             failures: next.push.failures,
           },
           commands: next.commands.map((each) =>
-            mine(each) ? { ...each, state: { kind: "sending" } } : each
+            sent.has(each) ? { ...each, state: { kind: "sending" } } : each
           ),
         };
       }
@@ -978,7 +1163,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       };
 
       effects.push(
-        { kind: "keep", pending: done },
+        keep(done),
         { kind: "answered", pending: done },
         { kind: "telemetry", name: "command.done", attributes: { ms: model.now - each.at } }
       );
@@ -991,13 +1176,29 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
     return [{ ...model, commands, target }, effects];
   }
 
-  /** A command that failed on the page: done with that outcome, never sent, and its kept intent dropped. */
-  function fail(pending: Pending<C, O>, message: string, now: number): Pending<C, O> {
-    return {
-      ...pending,
-      at: now,
-      state: { kind: "done", outcome: spec.refused(pending.command, message), revision: 0 },
-    };
+  /** Each command's state before the push in flight for `client`; unknown when this page can't tell. */
+  function prior(model: M, client: string) {
+    const pushing =
+      model.push.kind === "pushing" && model.push.client === client ? model.push : null;
+
+    return (each: Pending<C, O>): CommandState<O> =>
+      pushing?.was[pushing.ids.indexOf(each.id)] ?? { kind: "unknown", failure: "sent before" };
+  }
+
+  /** A command an attempt of which may have acted: unknown, kept so (once) so a reload still knows it may have. */
+  function uncertain(
+    pending: Pending<C, O>,
+    was: CommandState<O>,
+    failure: string,
+    effects: E[]
+  ): Pending<C, O> {
+    const next: Pending<C, O> = { ...pending, state: { kind: "unknown", failure } };
+
+    if (was.kind !== "unknown") {
+      effects.push(keep(next));
+    }
+
+    return next;
   }
 
   function reduce(model: M, msg: Msg<T, P, S, C, O>): Step {
@@ -1193,7 +1394,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
             now
           );
 
-          more.push({ kind: "keep", pending: done }, { kind: "answered", pending: done });
+          more.push(keep(done), { kind: "answered", pending: done });
 
           return done;
         });
@@ -1203,12 +1404,13 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
       case "pullFailed": {
         const failures = (at.pull.kind === "pulling" ? at.pull.failures : 0) + 1;
+        const wait = Math.max(backoff(failures), msg.failure.retryAfterMs ?? 0);
 
         return [
           {
             ...at,
             connection: failedConnection(at.connection, msg.failure),
-            pull: { kind: "idle", nextAt: now + backoff(failures), failures },
+            pull: { kind: "idle", nextAt: now + wait, failures },
             verify:
               at.verify.kind === "requested"
                 ? { kind: "pending", tries: at.verify.tries }
@@ -1221,13 +1423,16 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       case "pushed": {
         const ids = new Set(msg.ids);
         const [answered, effects] = answer(at, msg.client, msg.receipts, ids);
+        const before = prior(at, msg.client);
 
-        // A command the reply has no receipt for is still acting elsewhere: asked again.
-        const commands = answered.commands.map((each): Pending<C, O> =>
-          each.client === msg.client && ids.has(each.id) && each.state.kind === "sending"
-            ? { ...each, state: { kind: "unknown", failure: "the server is still on it" } }
-            : each
-        );
+        // A command the reply has no receipt for is still acting elsewhere: asked again, and kept as uncertain.
+        const commands = answered.commands.map((each): Pending<C, O> => {
+          if (each.client !== msg.client || !ids.has(each.id) || each.state.kind !== "sending") {
+            return each;
+          }
+
+          return uncertain(each, before(each), "the server is still on it", effects);
+        });
 
         const waiting = commands.some(
           (each) => each.client === msg.client && ids.has(each.id) && each.state.kind !== "done"
@@ -1245,40 +1450,84 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       }
 
       case "pushFailed": {
-        // Refused before anything acted: final. Anything else may have acted (an unreadable reply included), so it is
-        // unknown and asked again under the same key, which answers with the first outcome.
-        const final = msg.failure.kind === "forbidden" || msg.failure.kind === "conflict";
+        const failure = msg.failure;
         const ids = new Set(msg.ids);
+        const before = prior(at, msg.client);
         const effects: E[] = [];
 
+        // The server's own refusal of a request it never ran (its schema is checked before the handler, and a handler
+        // never refuses after anything acted): this attempt didn't act, though an earlier one may have.
+        const refused =
+          failure.refused === true &&
+          (failure.kind === "invalid" ||
+            failure.kind === "forbidden" ||
+            failure.kind === "conflict");
+
+        // A schema refusal naming one of this push's commands is that command's alone.
+        const index = refused && failure.kind === "invalid" ? commandAt(failure.path) : undefined;
+        const named = index === undefined ? undefined : msg.ids[index];
+
         const commands = at.commands.map((each): Pending<C, O> => {
-          if (each.client !== msg.client || !ids.has(each.id) || each.state.kind === "done") {
+          if (each.client !== msg.client || !ids.has(each.id) || each.state.kind !== "sending") {
             return each;
           }
 
-          if (!final) {
-            return { ...each, state: { kind: "unknown", failure: msg.failure.message } };
+          const was = before(each);
+          // An attempt whose outcome was lost may have acted: no later refusal makes it final.
+          const doubt = was.kind === "unknown";
+
+          if (named !== undefined) {
+            return each.id === named
+              ? refuse(each, doubt, failure.message, now, effects)
+              : { ...each, state: was };
           }
 
-          const done = fail(each, msg.failure.message, now);
-          effects.push({ kind: "keep", pending: done }, { kind: "answered", pending: done });
+          // An envelope refusal (a page and server of different releases) or a kit forbidden or conflict: nothing in
+          // this attempt acted. Final only for a command no attempt of which may have acted.
+          if (refused) {
+            return failure.kind === "invalid" || doubt
+              ? { ...each, state: was }
+              : refuse(each, false, failure.message, now, effects);
+          }
 
-          return done;
+          // Anything else may have acted (a lost reply, an unreadable one, a proxy's answer): asked again, same key.
+          return uncertain(each, was, failure.message, effects);
         });
 
-        const failures = (at.push.kind === "pushing" ? at.push.failures : 0) + 1;
+        const telemetry: E = {
+          kind: "telemetry",
+          name: "push.failed",
+          attributes: {
+            kind: failure.kind,
+            refused: failure.refused === true,
+            path: failure.path ?? null,
+          },
+        };
+
+        const pushing = at.push.kind === "pushing" ? at.push.failures : 0;
+
+        // One command refused by name: the rest go again at once, without it.
+        if (named !== undefined) {
+          return [
+            { ...at, commands, push: { kind: "idle", nextAt: now, failures: pushing } },
+            [...effects, telemetry],
+          ];
+        }
+
+        const failures = pushing + 1;
 
         return [
           {
             ...at,
             commands,
-            connection: failedConnection(at.connection, msg.failure),
-            push: { kind: "idle", nextAt: now + backoff(failures), failures },
+            connection: failedConnection(at.connection, failure),
+            push: {
+              kind: "idle",
+              nextAt: now + Math.max(backoff(failures), failure.retryAfterMs ?? 0),
+              failures,
+            },
           },
-          [
-            ...effects,
-            { kind: "telemetry", name: "push.failed", attributes: { kind: msg.failure.kind } },
-          ],
+          [...effects, telemetry],
         ];
       }
 
@@ -1325,13 +1574,60 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       }
 
       case "kept": {
-        const commands = at.commands.map((each): Pending<C, O> =>
-          each.client === msg.client && each.id === msg.id && each.state.kind === "saving"
-            ? { ...each, state: { kind: "queued" } }
-            : each
+        let admitted = false;
+
+        const commands = at.commands.map((each): Pending<C, O> => {
+          if (each.client !== msg.client || each.id !== msg.id || each.state.kind !== "saving") {
+            return each;
+          }
+
+          admitted = true;
+
+          return { ...each, state: { kind: "queued" } };
+        });
+
+        return [
+          {
+            ...at,
+            commands,
+            storage: working(at),
+            outbox: admitted ? { ...at.outbox, full: null } : at.outbox,
+          },
+          [],
+        ];
+      }
+
+      case "full": {
+        // Not a storage failure: the store answered, with no room. The tap is answered and not retained.
+        const gone = at.commands.find(
+          (each) => each.client === msg.client && each.id === msg.id && each.state.kind === "saving"
         );
 
-        return [{ ...at, commands, storage: working(at) }, []];
+        if (gone === undefined) {
+          return [{ ...at, storage: working(at) }, []];
+        }
+
+        const refused = fail(gone, "this device's outbox is full, so it wasn't kept or sent", now);
+
+        return [
+          {
+            ...at,
+            commands: at.commands.filter((each) => each !== gone),
+            storage: working(at),
+            outbox: {
+              ...at.outbox,
+              full: { kind: "full", waiting: msg.waiting, finished: msg.finished, max: msg.max },
+            },
+          },
+          [
+            { kind: "answered", pending: refused },
+            {
+              kind: "telemetry",
+              name: "commands.full",
+              attributes: { waiting: msg.waiting, finished: msg.finished, max: msg.max },
+            },
+          ],
+        ];
       }
 
       case "keepFailed": {
@@ -1360,7 +1656,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
       case "dropped": {
         if (msg.failure === null) {
-          return [{ ...at, storage: working(at) }, []];
+          return [{ ...at, storage: working(at), outbox: { ...at.outbox, full: null } }, []];
         }
 
         return [
@@ -1483,9 +1779,17 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
           return [at, []];
         }
 
+        // A tap no push could carry is answered now, never kept.
+        const alone = envelope(at.client, pending.dataset, at.replica.revision) + bytesOf(pending);
+
+        if (alone > pushBytes) {
+          return [numbered, [{ kind: "answered", pending: fail(pending, tooLarge(alone), now) }]];
+        }
+
+        // Admitted by the store, inside the keep's own transaction: a full outbox answers `full`, and the tap goes.
         return [
           { ...numbered, commands: [...at.commands, pending] },
-          [{ kind: "keep", pending: { ...pending, state: { kind: "queued" } } }],
+          [keep({ ...pending, state: { kind: "queued" } })],
         ];
       }
 
