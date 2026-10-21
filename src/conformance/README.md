@@ -172,8 +172,9 @@ and packed browser-size budgets also apply.
     complete convergence with concurrent writes, edited/tombstoned anchors, truthful tied-order coverage (null when
     the first page contains no complete group), dataset-scoped cursors, unknown cursors resetting, and receipts carrying
     their resource rows even on resets. Every paging-aware reply fits both row and byte caps, including deltas,
-    unpaged rows and receipt effects, tested together on a follow-up request. A delta over either cap becomes a bounded
-    newest-first paged reset; an older page shrinks to its byte budget without restarting. Ordinary small deltas remain
+    unpaged rows and receipt effects, tested together on a follow-up request. A delta that can't fit by itself becomes a
+    bounded newest-first paged reset; an older page shrinks to the row and byte room the delta leaves, without
+    restarting. Ordinary small deltas remain
     non-reset deltas for both paging-aware and legacy requests.
 
     **Compatibility exception:** a request **without** `page` receives today's whole legacy reply without page

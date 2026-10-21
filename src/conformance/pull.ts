@@ -483,11 +483,19 @@ export function pullConformance(input: PullConformance): void {
           request(first.patch.dataset, first.patch.revision, pageOf(first).next)
         );
 
-        // 13 delta rows + 3 older rows would fit; the separate, unchanged receipt resource makes 17.
+        // 13 delta rows and the receipt's resource fit (14 of 16): the older page shrinks to the 2 rows left, with no
+        // restart. A full 3-row page would make 17.
         bounded(reply);
-        expect(reply.patch.reset).toBe(true);
-        expect(pageOf(reply).from).toBeNull();
-        expect(reply.patch.rows.rows.map((row) => row.id)).toContain("combined-00");
+        expect(reply.patch.reset).toBe(false);
+        expect(pageOf(reply).from).toBe(pageOf(first).next);
+        expect(pageOf(reply).next).not.toBe(pageOf(first).next);
+        const ids = reply.patch.rows.rows.map((row) => row.id);
+        expect(ids).toStrictEqual(
+          expect.arrayContaining([...changes.map((row) => row.id), "combined-00"])
+        );
+        const older = ids.filter((id) => id.startsWith("combined-") && id !== "combined-00");
+        expect(older.length).toBeGreaterThan(0);
+        expect(older).toStrictEqual(["combined-17", "combined-16"].slice(0, older.length));
         expect(reply.receipts).toHaveLength(1);
       }
     );
