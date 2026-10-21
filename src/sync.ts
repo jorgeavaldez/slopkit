@@ -5,9 +5,19 @@
  * headless simulation over real stores and in the browser alike.
  *
  * Invariants it owns:
- * - **The replica only moves forward.** A pull applies only if newer (or a reset for another dataset). The disk commit
- *   is decided again against what the disk holds, inside its own transaction (`commitPlan`), so another tab or a
- *   failed write can't make the disk go back or skip a patch.
+ * - **The replica only moves forward.** A delta applies only to the same dataset with `since ≤ copy.revision ≤
+ *   reply.revision`; only a reset replaces the copy (a late one is dropped), and a reply it can't follow asks for a
+ *   real reset instead of leaving a gap. The disk commit is decided again against what the disk holds, inside its own
+ *   transaction (`commitPlan`), so another tab or a failed write can't make the disk go back or skip a patch.
+ * - **A copy never claims more history than it holds.** It is complete or partial (`History`): every row it holds is
+ *   the server's row at its revision, and a partial copy holds every row at or above its cursor, so every row at or
+ *   above `through`. The first reply draws the newest rows at once; the cursor moves only when a reply answers the
+ *   copy's own `next`, a reply without a page never changes it, and a row merged below `through` never deepens it.
+ *   The disk takes a page's history only from the cursor it moved from, in the transaction that writes its rows.
+ * - **A partial copy owes its next page**, back to back, until it is complete; a reply that doesn't move it on counts
+ *   as a failed pull, for backoff. An old server's reply to a partial copy asks for its whole copy instead.
+ * - **Only a complete copy is checked.** No fingerprint is asked for or compared while the copy is partial.
+ * - **A chunk costs its own size.** Merging a reply doesn't copy the tables it lands in (`Layered`).
  * - **Observed is not saved.** `saved` is what the disk is known to hold; a failed commit is retried whole until the
  *   disk catches up, and until then the page says so.
  * - **A pull is owed while the server is ahead.** `target` is the newest revision the server is known to have (pokes,
@@ -53,6 +63,123 @@ export type Lens<T, P> = {
   restore: (tables: T, values: readonly { key: Key; row: unknown }[]) => T | undefined;
 };
 
+/** A key a chunk removed, in a table's layer of changes. */
+const GONE = Symbol("gone");
+
+/**
+ * A table's rows after a chunk, without copying the rows it already had: the chunk's changes are a layer over them, so
+ * merging a chunk costs its own size, not the table's. Layers merge when a newer one is as big as the one below it, and
+ * fold into a plain map once the top one holds half as many keys as it, so lookups pass a logarithmic number of layers
+ * and a changed row is copied a logarithmic number of times. Immutable: a published value never changes.
+ */
+class Layered<K, V> implements ReadonlyMap<K, V> {
+  readonly size: number;
+  readonly base: ReadonlyMap<K, V>;
+  /** Newest first. */
+  readonly layers: readonly ReadonlyMap<K, V | typeof GONE>[];
+
+  constructor(
+    base: ReadonlyMap<K, V>,
+    layers: readonly ReadonlyMap<K, V | typeof GONE>[],
+    size: number
+  ) {
+    this.base = base;
+    this.layers = layers;
+    this.size = size;
+  }
+
+  private find(key: K): V | typeof GONE | undefined {
+    for (const each of this.layers) {
+      if (each.has(key)) {
+        return each.get(key);
+      }
+    }
+
+    return this.base.get(key);
+  }
+
+  get(key: K): V | undefined {
+    const value = this.find(key);
+
+    return value === GONE ? undefined : value;
+  }
+
+  // Rows are never undefined.
+  has(key: K): boolean {
+    return this.get(key) !== undefined;
+  }
+
+  // The base's keys in place, then new keys in the order they first came.
+  *entries(): MapIterator<[K, V]> {
+    for (const key of this.base.keys()) {
+      const value = this.get(key);
+
+      if (value !== undefined) {
+        yield [key, value];
+      }
+    }
+
+    const seen = new Set<K>();
+
+    for (let at = this.layers.length - 1; at >= 0; at--) {
+      for (const key of this.layers[at]?.keys() ?? []) {
+        const value = this.get(key);
+
+        if (!seen.has(key) && !this.base.has(key) && value !== undefined) {
+          seen.add(key);
+          yield [key, value];
+        }
+      }
+    }
+  }
+
+  *keys(): MapIterator<K> {
+    for (const [key] of this.entries()) {
+      yield key;
+    }
+  }
+
+  *values(): MapIterator<V> {
+    for (const [, value] of this.entries()) {
+      yield value;
+    }
+  }
+
+  [Symbol.iterator](): MapIterator<[K, V]> {
+    return this.entries();
+  }
+
+  forEach(each: (value: V, key: K, map: ReadonlyMap<K, V>) => void): void {
+    for (const [key, value] of this.entries()) {
+      each(value, key, this);
+    }
+  }
+}
+
+/** `rows` with `changes` over it, as a new value; `rows` is left as it was. */
+function overlay<K, V>(
+  rows: ReadonlyMap<K, V>,
+  changes: Map<K, V | typeof GONE>
+): ReadonlyMap<K, V> {
+  let size = rows.size;
+
+  for (const [key, value] of changes) {
+    size += (value === GONE ? 0 : 1) - (rows.has(key) ? 1 : 0);
+  }
+
+  const base = rows instanceof Layered ? rows.base : rows;
+  const below = rows instanceof Layered ? [...rows.layers] : [];
+  let top: ReadonlyMap<K, V | typeof GONE> = changes;
+
+  while (below[0] !== undefined && below[0].size <= top.size) {
+    top = new Map([...(below.shift() ?? []), ...top]);
+  }
+
+  const layered = new Layered(base, [top, ...below], size);
+
+  return top.size * 2 < base.size ? layered : new Map(layered);
+}
+
 export function table<T, P, R>(def: {
   name: string;
   schema: Schema<R>;
@@ -82,17 +209,13 @@ export function table<T, P, R>(def: {
         return tables;
       }
 
-      const next = new Map(reset ? [] : def.get(tables));
+      const changes = new Map<Key, R | typeof GONE>();
 
       for (const row of changed) {
-        if (gone(row)) {
-          next.delete(def.key(row));
-        } else {
-          next.set(def.key(row), row);
-        }
+        changes.set(def.key(row), gone(row) ? GONE : row);
       }
 
-      return def.set(tables, next);
+      return def.set(tables, overlay(reset ? new Map<Key, R>() : def.get(tables), changes));
     },
     snapshot: (tables) =>
       [...def.get(tables).entries()].map(([key, row]) => ({ table: def.name, key, row })),
@@ -114,12 +237,35 @@ export function table<T, P, R>(def: {
   };
 }
 
+/**
+ * How much of the server's history a copy holds. Complete: every row. Partial: every row at or above the keyset cursor
+ * `next` (the server's opaque cursor of the next older page), so every row at or above `through` (the fully covered
+ * boundary, as the app formats it; null while no order group is whole); `held` of `total` is progress, not a claim.
+ */
+export type History =
+  | { kind: "complete" }
+  | { kind: "partial"; next: string; through: string | null; held: number; total: number };
+
+/**
+ * A paged reply's place in the history: `from` is the cursor it answered (null on a reset's first page), `next` the
+ * next older one (null once complete), `through`, `held` and `total` as in `History`, at the reply's revision.
+ */
+export type Page = {
+  from: string | null;
+  next: string | null;
+  through: string | null;
+  held: number;
+  total: number;
+};
+
 export type Replica<T, S> = {
   dataset: string | null;
   revision: number;
   tables: T;
   /** What the server says about itself, read with every pull. */
   server: S | null;
+  /** How much of the history it holds; absent (a copy from before paging) is complete. */
+  history?: History;
 };
 
 /** A pull reply as sync sees it: rows changed since the pull's `since`, or everything (`reset`). */
@@ -130,7 +276,25 @@ export type Patch<P, S> = {
   rows: P;
   server: S;
   checksum?: string;
+  /** A paging server's place in the history: absent from an old server, whose reset is the whole copy. */
+  page?: Page;
 };
+
+const COMPLETE: History = { kind: "complete" };
+
+const historyOf = (replica: Replica<unknown, unknown>): History => replica.history ?? COMPLETE;
+
+/** The history a page leaves: complete without one (an old server's whole copy) or once no older page is left. */
+const covered = (page: Page | undefined): History =>
+  page === undefined || page.next === null
+    ? COMPLETE
+    : {
+        kind: "partial",
+        next: page.next,
+        through: page.through,
+        held: page.held,
+        total: page.total,
+      };
 
 /** A command's outcome as the server recorded it, and the revision at which its effects are visible. */
 export type Receipt<O> = { id: number; outcome: O; revision: number };
@@ -186,6 +350,11 @@ export type Model<T, S, C, O> = {
     nextAt: number;
   };
   target: number;
+  /**
+   * A reset this copy asks for: `paged` after a reply it couldn't apply (another dataset without a reset, a gap),
+   * `whole` (no `page`, as an old server understands) after an old server answered a partial copy.
+   */
+  restart: "paged" | "whole" | null;
   /** When a pull last succeeded: freshness, apart from the socket's liveness. */
   reconciledAt: number | null;
   connection: Connection;
@@ -255,13 +424,23 @@ export type Commit<T, S> = {
   reset: boolean;
   /** The revision the patch starts from: the disk takes it as a delta only if it is at least there. */
   base: number;
+  /** The cursor the copy held before this patch: the disk adopts the patch's history only from that same cursor. */
+  from?: string | null;
   /** The dataset this page last knew the disk to hold: the only one it may replace with another. */
   replaces: string | null;
 };
 
 export type Effect<T, S, C, O> =
   | { kind: "load" }
-  | { kind: "pull"; client: string; dataset: string | null; since: number; verify: boolean }
+  | {
+      kind: "pull";
+      client: string;
+      dataset: string | null;
+      since: number;
+      verify: boolean;
+      /** The older page wanted (null: none, but a paged reset is understood); absent asks an old server's whole reply. */
+      page?: string | null;
+    }
   | {
       kind: "push";
       client: string;
@@ -333,45 +512,122 @@ export function settled<T, S, C, O>(model: Model<T, S, C, O>, pending: Pending<C
   return pending.state.kind === "done" && model.replica.revision >= pending.state.revision;
 }
 
-/** Whether what the page shows is also on the disk. */
+/**
+ * Whether what the page shows is also on the disk: by revision only, so tabs at different cursors never chase each
+ * other's writes. A failed write is owed again even at the same revision (a page that failed to land).
+ */
 export function saved<T, S, C, O>(model: Model<T, S, C, O>): boolean {
   return (
-    model.saved.dataset === model.replica.dataset && model.saved.revision >= model.replica.revision
+    model.saved.dataset === model.replica.dataset &&
+    model.saved.revision >= model.replica.revision &&
+    model.saved.failures === 0
   );
 }
 
 /**
  * What a commit does to the disk, decided inside the disk's own transaction from what it holds: nothing when the disk
- * already has this or newer (another tab got there), the patch alone when the disk is at least at its base, else the
- * whole replica, so a skipped or failed patch is never covered by a later checkpoint. A page may replace the disk's
+ * already has this or newer (another tab got there; a complete copy at the same revision is newer than any page), the
+ * patch alone when the disk is at least at its base, else the whole replica, so a skipped or failed patch is never
+ * covered by a later checkpoint. A delta keeps the disk's own history, and takes the patch's only when the disk is at
+ * the cursor the patch moved from (`adopt`): coverage never lands without its rows. A page may replace the disk's
  * dataset only with one it moved to from that very dataset (`replaces`): a tab still on a dataset the server has since
  * replaced is `stale` and never writes it back.
  */
 export function commitPlan(
-  stored: { dataset: string | null; revision: number },
+  stored: { dataset: string | null; revision: number; history?: History },
   commit: {
     dataset: string | null;
     revision: number;
     reset: boolean;
     base: number;
     replaces: string | null;
+    from?: string | null;
   }
-): "skip" | "delta" | "whole" | "stale" {
+): "skip" | "delta" | "adopt" | "whole" | "stale" {
   const same = stored.dataset === commit.dataset;
+  const disk = stored.history ?? COMPLETE;
 
   if (!same && stored.dataset !== null && stored.dataset !== commit.replaces) {
     return "stale";
   }
 
-  if (same && stored.revision >= commit.revision) {
+  if (
+    same &&
+    (stored.revision > commit.revision ||
+      (stored.revision === commit.revision && disk.kind === "complete"))
+  ) {
     return "skip";
   }
 
   if (!commit.reset && same && stored.revision >= commit.base) {
-    return "delta";
+    return disk.kind === "partial" && disk.next === commit.from ? "adopt" : "delta";
   }
 
   return "whole";
+}
+
+/** How much history the page holds, as a closed subject for the app's state table. */
+export type HistoryState =
+  | { kind: "loading" }
+  | { kind: "none" }
+  | { kind: "complete" }
+  | { kind: "partial"; through: string | null; held: number; total: number };
+
+/**
+ * The copy's history: loading while storage loads, none without a dataset, else partial or complete. Partial is a claim
+ * beside the numbers ("history from <through>, loading older · held of total"), and totals cover only `through` and
+ * above. Complete says nothing about storage: that is `deriveDurabilityState`, its own subject.
+ */
+export function deriveHistoryState<T, S, C, O>(model: Model<T, S, C, O>): HistoryState {
+  if (model.boot.kind === "loading") {
+    return { kind: "loading" };
+  }
+
+  if (model.replica.dataset === null) {
+    return { kind: "none" };
+  }
+
+  const history = historyOf(model.replica);
+
+  return history.kind === "complete"
+    ? history
+    : { kind: "partial", through: history.through, held: history.held, total: history.total };
+}
+
+/** Whether the page's copy is kept on this device, as a closed subject apart from how much history it holds. */
+export type DurabilityState =
+  | { kind: "loading" }
+  | { kind: "unsaved" }
+  | { kind: "lost"; reason: string }
+  | { kind: "failing"; reason: string }
+  | { kind: "replaced" }
+  | { kind: "unreadable"; count: number }
+  | { kind: "ok" };
+
+/**
+ * The copy's durability at the model's clock: loading, replaced by another tab, a failing store (lost while the page
+ * shows more than the disk holds), unsaved past the storage deadline, commands kept that this version can't read, or ok.
+ */
+export function deriveDurabilityState<T, S, C, O>(model: Model<T, S, C, O>): DurabilityState {
+  const behind = model.saved.behindSince;
+
+  if (model.boot.kind === "loading") {
+    return { kind: "loading" };
+  }
+
+  if (model.storage.kind === "replaced") {
+    return { kind: "replaced" };
+  }
+
+  if (model.storage.kind === "failed") {
+    return { kind: behind === null ? "failing" : "lost", reason: model.storage.reason };
+  }
+
+  if (behind !== null && model.now - behind >= STORAGE_DEADLINE_MS) {
+    return { kind: "unsaved" };
+  }
+
+  return model.unreadable > 0 ? { kind: "unreadable", count: model.unreadable } : { kind: "ok" };
 }
 
 /**
@@ -433,6 +689,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
     revision: 0,
     tables: spec.empty,
     server: null,
+    history: COMPLETE,
   });
 
   function initial(client: string, now: number): M {
@@ -451,6 +708,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
         nextAt: now,
       },
       target: 0,
+      restart: null,
       reconciledAt: null,
       connection: { kind: "starting" },
       socket: { open: false, heardAt: 0 },
@@ -465,30 +723,42 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
   }
 
   /**
-   * The one merge: a patch applied to a replica, with its disk operations, or undefined when it is older than the
-   * replica (a late reply). A reset or another dataset replaces everything.
+   * The one merge: a patch applied to a replica, with its disk operations; undefined when it is older than the replica
+   * (a late reply), `gap` when it can't follow from it. Only a reset (or the answer to `since` 0, which holds
+   * everything) replaces the copy, with its own history. A delta applies only to the same dataset with
+   * `since ≤ copy.revision ≤ reply.revision` (equal only with a page or new server facts); it moves the cursor only when
+   * it answers the copy's own `next`, and a reply without a page never changes the history.
    */
   function merge(
     replica: Replica<T, S>,
-    patch: Patch<P, S>
-  ): { replica: Replica<T, S>; ops: Op[]; reset: boolean } | undefined {
-    const reset = patch.reset || patch.dataset !== replica.dataset;
+    patch: Patch<P, S>,
+    since: number
+  ): { replica: Replica<T, S>; ops: Op[]; reset: boolean } | "gap" | undefined {
+    const reset = patch.reset || since === 0;
+    const page = patch.page;
+    const was = historyOf(replica);
+    let history = was;
 
-    if (!reset && patch.revision <= replica.revision) {
-      // Nothing newer, but the server's own facts (version, settings) may have moved.
-      if (
-        patch.revision === replica.revision &&
-        JSON.stringify(patch.server) !== JSON.stringify(replica.server)
-      ) {
-        return { replica: { ...replica, server: patch.server }, ops: [], reset: false };
+    if (reset) {
+      // A reset older than what we hold of the same dataset is a late reply.
+      if (patch.dataset === replica.dataset && patch.revision < replica.revision) {
+        return undefined;
       }
 
-      return undefined;
-    }
-
-    // A reset older than what we hold of the same dataset is a late reply.
-    if (reset && patch.dataset === replica.dataset && patch.revision < replica.revision) {
-      return undefined;
+      history = covered(page);
+    } else if (patch.dataset !== replica.dataset || since > replica.revision) {
+      return "gap";
+    } else if (
+      patch.revision < replica.revision ||
+      (patch.revision === replica.revision && page === undefined)
+    ) {
+      // Nothing newer, but the server's own facts (version, settings) may have moved.
+      return patch.revision === replica.revision &&
+        JSON.stringify(patch.server) !== JSON.stringify(replica.server)
+        ? { replica: { ...replica, server: patch.server }, ops: [], reset: false }
+        : undefined;
+    } else if (page !== undefined && was.kind === "partial" && page.from === was.next) {
+      history = covered(page);
     }
 
     let tables = reset ? spec.empty : replica.tables;
@@ -500,7 +770,13 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
     }
 
     return {
-      replica: { dataset: patch.dataset, revision: patch.revision, server: patch.server, tables },
+      replica: {
+        dataset: patch.dataset,
+        revision: patch.revision,
+        server: patch.server,
+        tables,
+        history,
+      },
       ops,
       reset,
     };
@@ -526,21 +802,28 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       const polling =
         next.connection.kind !== "live" || unsettled || (spec.outstanding?.(next.replica) ?? false);
 
-      const verifying = next.verify.kind === "pending";
+      const history = historyOf(next.replica);
+      const whole = next.restart === "whole";
+      // Only a complete copy is checked: a fingerprint of everything can't certify part of it.
+      const verifying = next.verify.kind === "pending" && (history.kind === "complete" || whole);
+      // A partial copy owes its next page, back to back, until it is complete.
+      const owed = behind || verifying || history.kind === "partial" || next.restart !== null;
+      const since = next.restart === null ? next.replica.revision : 0;
 
-      if (((behind || verifying) && (failures === 0 || due)) || (polling && due)) {
+      if ((owed && (failures === 0 || due)) || (polling && due)) {
         out.push({
           kind: "pull",
           client: next.client,
           dataset: next.replica.dataset,
-          since: next.replica.revision,
+          since,
           verify: verifying,
+          ...(whole ? {} : { page: history.kind === "partial" && since > 0 ? history.next : null }),
         });
         next = {
           ...next,
-          pull: { kind: "pulling", since: next.replica.revision, failures },
+          pull: { kind: "pulling", since, failures },
           verify:
-            next.verify.kind === "pending"
+            verifying && next.verify.kind === "pending"
               ? { kind: "requested", tries: next.verify.tries }
               : next.verify,
         };
@@ -737,9 +1020,23 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       }
 
       case "pulled": {
-        const merged = merge(at.replica, msg.patch);
+        const result = merge(at.replica, msg.patch, msg.since);
+        const merged = result === "gap" ? undefined : result;
         const replica = merged?.replica ?? at.replica;
         const effects: E[] = [];
+        const was = historyOf(at.replica);
+        const history = historyOf(replica);
+        const failures = at.pull.kind === "pulling" ? at.pull.failures : 0;
+
+        // A partial copy this reply didn't move on (the same page again, a repeated first page, a reply it couldn't
+        // take) is a pull that failed, for backoff: never a busy loop on a server that doesn't move.
+        const stuck =
+          was.kind === "partial" &&
+          (merged === undefined ||
+            (msg.patch.page !== undefined &&
+              history.kind === "partial" &&
+              history.next === was.next &&
+              replica.dataset === at.replica.dataset));
 
         let next: M = {
           ...at,
@@ -748,12 +1045,23 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
             msg.patch.dataset === at.replica.dataset
               ? Math.max(at.target, msg.patch.revision)
               : msg.patch.revision,
+          // A reply it couldn't follow asks a real reset; an old server's reply to a partial copy, its whole copy.
+          restart:
+            result === "gap"
+              ? (at.restart ?? "paged")
+              : merged?.reset === true
+                ? null
+                : history.kind === "partial" && merged !== undefined && msg.patch.page === undefined
+                  ? "whole"
+                  : at.restart,
           reconciledAt: now,
           connection:
             at.socket.open && now - at.socket.heardAt < SOCKET_DEADLINE_MS
               ? { kind: "live" }
               : { kind: "stale" },
-          pull: { kind: "idle", nextAt: now + POLL_MS, failures: 0 },
+          pull: stuck
+            ? { kind: "idle", nextAt: now + backoff(failures + 1), failures: failures + 1 }
+            : { kind: "idle", nextAt: now + POLL_MS, failures: 0 },
         };
 
         if (merged !== undefined && next.storage.kind !== "replaced") {
@@ -764,14 +1072,17 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
             reset: merged.reset,
             base: msg.since,
             replaces: at.saved.dataset,
+            from: was.kind === "partial" ? was.next : null,
           });
           next = { ...next, saved: { ...next.saved, writing: next.saved.writing + 1 } };
         }
 
         if (at.verify.kind === "requested") {
-          // The fingerprint describes the server at the reply's revision: comparable only if the replica is there.
+          // The fingerprint describes the server at the reply's revision: comparable only if the replica is there, and
+          // whole (a fingerprint of everything never certifies part of it).
           if (
             msg.patch.checksum !== undefined &&
+            history.kind === "complete" &&
             replica.revision === msg.patch.revision &&
             replica.dataset === msg.patch.dataset
           ) {
@@ -789,7 +1100,8 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
           if (
             each.state.kind === "done" ||
             each.dataset === null ||
-            each.dataset === msg.patch.dataset
+            replica.dataset === null ||
+            each.dataset === replica.dataset
           ) {
             return each;
           }

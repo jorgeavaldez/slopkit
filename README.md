@@ -94,6 +94,44 @@ export default defineConfig({
 });
 ```
 
+### sync in pages
+
+a device with no copy draws its newest rows after one round trip, whatever the history's size, then pulls older pages
+back to back until it holds everything. the server half is `slopkit/server/pull`: one history table paged newest
+first by a keyset order, the other tables whole, receipts with the rows they name, all in one read transaction and
+within your caps.
+
+```ts
+import { createPull } from "slopkit/server/pull";
+
+const pulls = createPull({
+  db, dataset: () => store.dataset(), revision: () => store.revision(),
+  // newest first by (date, id), descending; id is unique. bump version when the order changes
+  paged: { table: "transactions", order: ["date", "id"], version: 1, live: "deleted = 0", read: toTransaction,
+    through: ([date]) => String(date) },
+  unpaged: (since) => ({ accounts: store.accounts(since) }), // whole on every reset
+  receipts: { read: (since, viewer: Viewer) => ledger.receipts(viewer.principal, viewer.client, since),
+    names: (each) => [each.receipt.transaction] },
+  limits: { firstRows: 200, pageRows: 2000, maxRows: 5000, maxBytes: 2_000_000 },
+  // your endpoint's reply: the caps measure its json
+  respond: ({ rows, unpaged, receipts, ...rest }) => ({ ...rest, transactions: rows, ...unpaged, commands: receipts }),
+});
+
+route(pull, (request, caller) => pulls.pull(request, viewerOf(request, caller)).reply);
+```
+
+the page's pull request carries `page` (the engine fills it in; a request without it gets the old whole reply), and
+the copy's history is its own subject: place `deriveHistoryState(model)` (loading, none, partial, complete) and
+`deriveDurabilityState(model)` (the storage states) in two tables and compose both. partial is a claim beside the
+numbers, "history from <through>, loading older · held of total", and totals cover only `through` and above. run the
+pull contract against your own pull in your tests:
+
+```ts
+import { pullConformance } from "slopkit/conformance/pull";
+
+pullConformance({ name: "my app", create: async (limits) => fixtureOverMyRealStore(limits) });
+```
+
 the shared lint rules go on top of ultracite's presets (`oxlint.config.ts`):
 
 ```ts

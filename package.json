@@ -82,6 +82,10 @@
       "types": "./dist/server/jobs.d.ts",
       "default": "./dist/server/jobs.js"
     },
+    "./server/pull": {
+      "types": "./dist/server/pull.d.ts",
+      "default": "./dist/server/pull.js"
+    },
     "./server/web": {
       "types": "./dist/server/web.d.ts",
       "default": "./dist/server/web.js"
@@ -117,6 +121,18 @@
     "./conformance/fixtures": {
       "types": "./dist/conformance/fixtures.d.ts",
       "default": "./dist/conformance/fixtures.js"
+    },
+    "./conformance/legacy/replica-012": {
+      "types": "./dist/conformance/legacy/replica-012.d.ts",
+      "default": "./dist/conformance/legacy/replica-012.js"
+    },
+    "./conformance/paging-fixtures": {
+      "types": "./dist/conformance/paging-fixtures.d.ts",
+      "default": "./dist/conformance/paging-fixtures.js"
+    },
+    "./conformance/pull": {
+      "types": "./dist/conformance/pull.d.ts",
+      "default": "./dist/conformance/pull.js"
     },
     "./package.json": "./package.json"
   },
