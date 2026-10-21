@@ -80,6 +80,112 @@ Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs th
 2. An action produces a durable keep first; only its completion permits sending.
 3. A fingerprint result for revision N can't certify revision N+1.
 
+### Paged first copy (`paging.test.ts`, `paging-network.test.ts`, `paging-storage.test.ts`, `paging-state.test.ts`, `paging-budget.test.ts`)
+
+The public paging vocabulary is:
+
+- `sync.History` is `{ kind: "complete" } | { kind: "partial"; next: string; through: string | null;
+  held: number; total: number }`; `Replica.history` keeps it. A whole reply or checkpoint from before paging means
+  complete. An empty replica is complete at revision zero, not an authoritative empty server dataset.
+- `sync.Page` is `{ from: string | null; next: string | null; through: string | null; held: number; total: number }`;
+  `Patch.page?: Page` carries it. `from` is the cursor answered, null on a reset's first page; `next` is the next older
+  cursor, null on completion. Cursors include the dataset, order version, order values and unique tie-breaker, never
+  an offset or a lookup of an anchor's current row. `through` is the formatted **fully covered** order boundary, not
+  the oldest row held. When a page splits a tie, it excludes that tie until the entire group lands; if no order group
+  is fully covered yet, it is null. `held` is progress (paged rows at or above the keyset cursor), not the size of the
+  fully covered range; `total` counts all live paged rows at the chunk's revision. Extra delta or receipt rows below
+  the cursor do not deepen the claim.
+- Pull effects and `client.NetworkPort.pull` requests carry `page?: string | null`. A new client normally sends null
+  on its first/reset-or-delta request, then `history.next` while partial. Omission requests the transitional legacy
+  whole protocol. `verify` is false while partial. `Commit.from?: string | null` carries the cursor a page moved from;
+  the adapter checks it and the durable history in the same transaction as rows and checkpoint.
+- `sync.HistoryState` is the closed union `loading`, `none`, `complete`, and
+  `partial { through: string | null; held: number; total: number }` (each member has `kind`).
+  `sync.deriveHistoryState(model)` returns loading while boot loads, none when ready without a dataset, otherwise
+  partial or complete from the replica's history. Complete history never promises that storage is healthy.
+- `sync.DurabilityState` is the independent closed union `loading`, `unsaved`, `lost { reason }`,
+  `failing { reason }`, `replaced`, `unreadable { count }`, and `ok`.
+  `sync.deriveDurabilityState(model)` uses the model's clock: boot loading first, then replaced, then a failed store
+  (lost if an observed write is owed, failing otherwise), an overdue unsaved copy, unreadable commands, or ok.
+  Fetching and waiting for a server are connection facts, not durability states.
+- Each union is a separate subject the app places with `states.Table` and includes in composition. Neither one
+  replaces the other: partial coverage and storage trouble remain drawn together in either composition order.
+  Partial means `partial`, on `main`, as a claim: “history from <through>, loading older · held of total”; null means
+  no fully covered history range yet. Totals and aggregates use the fully covered range, never incidental older rows.
+  The state tests' tables and negative type cases consume the actual public derivers' return unions.
+
+Requirements, with the numbered histories they cover:
+
+1. After every applied chunk, every held row is the reference's row at that revision, and all rows in the claimed
+   covered range are held. Edits, inserts and tombstones on both sides of the cursor, including an edited and then
+   tombstoned anchor, preserve this invariant.
+2. Equal-revision pages merge. A duplicate page cannot move the cursor twice. An unexpected `from` may merge current
+   rows but cannot advance coverage; a reply older than the copy is dropped whole and cannot resurrect a row.
+3. Only a reset replaces a dataset; its own history starts over. Commands from the old dataset are refused, including
+   those whose earlier delivery is unknown.
+4. A delta applies only with the same dataset and `since <= copy.revision <= reply.revision`. After a verification
+   mismatch empties the copy, an in-flight delta cannot advance it across a gap; a real reset remains owed.
+5. Named seeded histories with dropped, duplicate and delayed deliveries, recovery and reload converge to the exact
+   reference rows and complete history. The production executor and real durable adapter run unchanged.
+6. The first reply exposes newest rows and partial coverage immediately: one round trip, not a wait for completion.
+7. Partial history itself owes another pull, back to back, carrying `next`. No-progress replies, repeated first-page
+   resets included, back off; the obligation survives until complete.
+8. No digest request or fingerprint comparison certifies partial history. Verification runs once complete.
+9. A partial copy receiving an old server's non-reset reply without `page` preserves its history and asks for a whole
+   reset (`since: 0`, no `page`). The resulting whole reset is complete.
+10. An edited row below the coverage boundary never moves it merely because that row is held.
+11. A command settled by a paged reset holds the row its receipt names, even below the page's boundary.
+12. Each page's rows and history are durable together. A mid-download reload requests the stored cursor; two remaining
+   pages cost two page requests, with at most one additional verification pull, not a restarted first copy.
+13. Partial checkpoints use foreign row shapes for 0.1.2: an already-open old tab is fenced from overwriting a newer
+   partial checkpoint; a reloaded old adapter loads no partial rows. That release may then fetch a legacy whole copy
+   and replace the partial checkpoint. The new adapter reads that whole copy as complete, with every row present.
+   `legacy/replica-012.ts` preserves the released adapter and commit decision, with import relocation and local legacy
+   port/replica types only; the released row-shape string is pinned literally. Whole-copy read/write controls pass
+   before and after paging, in both release directions.
+14. A native failed page commit leaves a whole write owed even at the same revision. A retry repairs both rows and
+   cursor, without acknowledging an aborted page.
+15. Concurrent tabs at different cursors and revisions never persist coverage without its rows, regress a complete
+   checkpoint to partial, or enter a busy whole-write loop. Both clients can finish, and durable rows remain exact.
+
+Deterministic merge budget: processing a two-row chunk through `sync.update`, including emitted commit effects,
+visits no more old rows at 100,000 rows than at 1,000 rows: no whole-table traversal/copy. Previously published table
+values remain unchanged. This is the algorithmic gate, not a claim about phone wall-clock latency; device long-task
+and packed browser-size budgets also apply.
+
+### Server pull (`pull.ts`)
+
+16. `slopkit/conformance/pull` exports `pullConformance(input: PullConformance): void`, registering black-box tests for
+    an application's real pull function. `PullConformance` is `{ name: string; create(limits): Promise<PullFixture> }`.
+    The fixture is new for each case and supplies only `pull`, transactional `write`, dataset `replace`, and `close`.
+    `pull.ts` exports all input/result types. The application's adapter maps its paged table to synthetic `PullRow`
+    (`id`, numeric `value`, `revision`, `deleted`), ordered by `(value, id)` descending, formats `through` as
+    `String(value)`, maps an unpaged table and receipt resource ids, and reports the **actual encoded response bytes**
+    before normalization. It must not page, merge, bound, or repair the response itself.
+
+    The fixture's `write` stamps the returned revision on every changed row, in one committed transaction, and can
+    record a receipt naming a resource in that same transaction. `replace` starts an empty new dataset. Real SQLite,
+    the real application's pull and its actual decoding run behind this adapter; no in-memory pull implementation.
+    The kit's own adapter uses `server/pull`, which ships the transactional SQLite chunk assembler.
+
+    The cases require newest first, stable ties, exactly-once reachability without writes, current held rows and
+    complete convergence with concurrent writes, edited/tombstoned anchors, truthful tied-order coverage (null when
+    the first page contains no complete group), dataset-scoped cursors, unknown cursors resetting, and receipts carrying
+    their resource rows even on resets. Every paging-aware reply fits both row and byte caps, including deltas,
+    unpaged rows and receipt effects, tested together on a follow-up request. A delta over either cap becomes a bounded
+    newest-first paged reset; an older page shrinks to its byte budget without restarting. Ordinary small deltas remain
+    non-reset deltas for both paging-aware and legacy requests.
+
+    **Compatibility exception:** a request **without** `page` receives today's whole legacy reply without page
+    metadata, unbounded. Bounds apply to paging-aware requests, not this transitional path.
+
+    Fixture caps are first page 2, later pages 3, reply at most 16 rows and 8192 encoded bytes. With no concurrent
+    writes or byte pressure, N rows complete in `1 + ceil(max(0, N - firstRows) / pageRows)` requests (at least one),
+    and the first reply's page is bounded independently of total history (1,000 rows in the budget case). Apps with
+    growing page caps use the equivalent cumulative-cap formula in their own budget. Byte pressure is tested
+    independently of row pressure, using additional fixtures with byte caps calibrated from actual encoded replies.
+    The harness is shipped code, not a fake server; each app runs it on its own pull.
+
 ### Client executor (`client.test.ts`, `push-since.test.ts`, `push-batch.test.ts`)
 
 1. Nothing reaches the network before the intent's transaction commits.

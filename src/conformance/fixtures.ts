@@ -18,7 +18,7 @@ import { createSync, table } from "../sync.ts";
 import type { Key, Pending, Replica } from "../sync.ts";
 import { indexedReplica } from "../web/replica.ts";
 
-const rowSchema = object(
+export const rowSchema = object(
   {
     id: string(),
     value: number({ integer: true }),
@@ -34,7 +34,7 @@ export type Tables = { rows: ReadonlyMap<Key, Row> };
 
 export type PatchRows = { rows: Row[] };
 
-const serverSchema = object({ build: string() }, { strict: true });
+export const serverSchema = object({ build: string() }, { strict: true });
 
 export type Server = Infer<typeof serverSchema>;
 
@@ -53,7 +53,7 @@ export const outcomeSchema = variant("kind", {
 
 export type Outcome = Infer<typeof outcomeSchema>;
 
-const pendingSchema = object({
+export const pendingSchema = object({
   client: string(),
   id: number({ integer: true, min: 1 }),
   dataset: nullable(string()),
@@ -75,7 +75,7 @@ const pendingSchema = object({
 
 const empty: Tables = { rows: new Map() };
 
-const rowsLens = table<Tables, PatchRows, Row>({
+export const rowsLens = table<Tables, PatchRows, Row>({
   name: "rows",
   schema: rowSchema,
   rows: (patch) => patch.rows,
