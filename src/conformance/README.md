@@ -4,7 +4,7 @@ The kit's contract as executable checks. The expected results come from the cont
 currently answers, and the suite ships with the package so every app runs it against the kit version it installs.
 
 Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs the built copy from its installed package
-(see the README). Run the type check too: `states.test.ts` holds compile-time rejections (below).
+(see the README). Run the type check too: `states.test.ts` and `push-refusal.test.ts` hold compile-time rejections.
 
 ## Method
 
@@ -15,8 +15,9 @@ Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs th
   not an oracle.
 - The production client executor runs unchanged. The network peer supplies controlled inputs and results, not a
   replacement client.
-- SQLite is real and reopens an on-disk file. IndexedDB uses separate `fake-indexeddb` factories and the production
-  adapter; these headless checks don't replace adapter checks in native browsers.
+- SQLite is real and reopens an on-disk file. IndexedDB uses `fake-indexeddb` and the production adapter, with shared
+  factories for overlapping tabs and separate factories for isolated devices. HTTP boundaries use real loopback
+  servers. These headless checks don't replace adapter checks in native browsers.
 - Barriers control completion order. No sleeps and no mocked timers; a provider result that never returns holds no
   timer or process.
 - Expected results are the contract's: a failing case is a defect in the code, and an expected result changes only
@@ -206,6 +207,77 @@ and packed browser-size budgets also apply.
 9. A push carries at most `pushMax` commands (default `PUSH_MAX`, 50), oldest first: 120 kept commands go out as
    pushes of 50, 50 and 20, each command once, and every one reaches an outcome.
 
+### Refused pushes and bounds (`push-refusal.test.ts`, `push-bytes.test.ts`, `outbox-bound.test.ts`)
+
+The public vocabulary is:
+
+- `contract.Failure.kind` includes `unreadable`: a successful reply was not the JSON its response schema requires.
+  It may have acted. `server/web.Refusal` excludes `unreadable`; it is a client observation, never a server refusal.
+  A failure may carry `refused?: true`, `path?: string`, and `retryAfterMs?: number`. `call` sets `refused` only for
+  the kit's JSON `{ kind, message, path? }` error body whose kind matches its HTTP status; status alone never proves
+  refusal. A schema 400's `path` is `Invalid.path` unchanged, e.g. `request.commands[1].command.value`, and `call`
+  preserves it. Only a valid index in this push's `request.commands[i]` path names one command. A missing path, an
+  envelope path or an index outside the batch is incompatible, not a per-command refusal.
+- `CommandState`'s unknown member gains `parked?: true`: `{ kind: "unknown"; failure: string; parked?: true }`.
+  Parked means needs attention, not a final outcome: kept across reloads, excluded from pushes, still named in pulls
+  and answerable by a real receipt. An attempt with a lost outcome remains uncertain through retries and reloads;
+  a later refusal cannot make it final. A known refusal restores each unaffected command's prior state.
+- HTTP 408 and 429 are `unavailable`, with the parsed `Retry-After` in `retryAfterMs`; retries honour both backoff and
+  that floor. HTTP 404, 405 and 413 are `invalid` without a command path (incompatible), logged. Proxy 403 and 409
+  without a matching kit body keep their status classification but are not final. A successful HTML, malformed JSON
+  or schema-bad JSON reply is `unreadable`, not a request refusal. Redirects still mean signed out.
+- `sync.PUSH_BYTES` is 49,152 (48 KiB); `Spec.pushBytes` overrides it. Both it and `pushMax` are positive safe integers.
+  The byte count is UTF-8 `JSON.stringify` of the **whole** push request that `call` sends, envelope included. An app
+  gives its push server the same bound (`serveWeb.bodyLimit`), not a character limit. Oldest-first packing stops at
+  the first command that cannot join this batch; it never fills the gap with a later smaller command. An intent too
+  large even alone is answered at the tap without retention; an already-kept one is refused and kept if never
+  uncertain, otherwise parked, and skipped so later commands can proceed.
+- `sync.OUTBOX_MAX` is 500; `Spec.outboxMax` overrides it with a positive safe integer. The executor passes that bound
+  to `StoragePort.keep(pending, max?)` (the omitted bound is `OUTBOX_MAX`). A successful write resolves `void`; a new
+  key refused at capacity resolves `{ kind: "full"; waiting: number; finished: number; max: number }`. The IndexedDB
+  transaction checks the stored count and writes together. An existing key may always update, even over capacity;
+  unreadable stored keys still occupy capacity. Old records are never truncated. A full answer is not a storage
+  failure: the executor answers a transient done `Pending` using `Spec.refused`, revision zero, with a message naming
+  the full outbox, and removes that tap from the model without keeping it. `joins` runs before admission.
+- `sync.OutboxState` is `{ kind: "ok" } | { kind: "full"; waiting: number; finished: number; max: number }`.
+  `sync.deriveOutboxState(model)` is an independent subject for an app's state table. Waiting commands need a
+  connection; finished commands need dismissal, not reconnection. Counts include the store's capacity-refusal
+  snapshot when another tab filled it, not just this page's commands. A later admission still asks the transaction;
+  an old full snapshot must not permanently forbid trying after another tab frees capacity.
+
+Requirements:
+
+1. A three-command batch with a schema-bad middle command acts zero times on the rejected request. Only that command
+   gets the server's refusal, kept and answered; the other two are resent once, receive receipts and act once each.
+   The rejection is logged. The 400 body carries the exact schema path before any handler effect.
+2. A command that acted before a lost reply reconciles to its real receipt after a retry batch's 400 names a different
+   command. A kit forbidden/conflict after prior uncertainty cannot manufacture a final outcome either.
+3. An uncertain command named by a schema refusal parks durably, is never sent again (after reload too), stays named
+   in pulls and becomes done with the actual receipt when that pull lands.
+4. A strict envelope mismatch is incompatible, returns commands to their prior state and acts zero times. Reload with
+   the matching contract completes them once under the original identities.
+5. Only a matching kit error body can be final: proxy HTML, JSON without kind and a mismatched kind cannot settle a
+   command. HTTP 408/429 wait until the provider's retry floor; HTTP 404/405/413 stop as incompatible with unknown
+   intents and a log. Unreadable success is unknown and incompatible; reload obtains the original ledger receipt.
+6. Multibyte commands fit the default 48-KiB request cap and a custom cap, preserving exact tap order. Packing cannot
+   skip a non-fitting middle command to send a smaller later one.
+7. A stored oversize oldest command, queued or uncertain, is refused or parked respectively; later work still sends.
+   A new oversize tap has an answer but no model, disk or network record.
+8. A UTF-8 character split between real HTTP body chunks reaches the handler intact. The byte cap refuses a body
+   whose character count fits but byte count does not, before its handler runs.
+9. Two offline executors sharing one IndexedDB admit no more than one shared maximum, despite overlapping keeps and
+   stale page counts. Every other tap is answered, with no model or disk record and no storage-failure state.
+10. A full outbox changes neither the model's retained commands nor durable records on another tap; an equivalent
+    `joins` tap still coalesces first. A delayed load cannot admit beyond the already-full disk.
+11. An over-capacity load keeps all old records. Receipts still update those records. New keys remain refused until
+    dismissal takes the count below max; then admission resumes. The outbox subject distinguishes waiting-only and
+    finished-only full states, and becomes ok when there is room.
+
+Push handlers answer per-command outcomes as receipts: after any command in a request acted, they never throw a
+final-kind refusal for the request. The ledger case sends a successful command followed by a conflicting identity,
+receives both per-command receipts, and replays without repeating the first effect. Whole-request schema validation
+runs before the handler, so a schema rejection with a command path proves no command acted in **that attempt**.
+
 ### Pure view
 
 1. Elapsed keep time is shown as slow storage, not as a final "not sent".
@@ -226,7 +298,7 @@ Enforcers, and the mutations each case must catch:
 - Retained inputs: mutating the caller's order, looks, table or parts after validation changes nothing.
 - Retry delay: remove the doubling, the cap or the provider-hint floor.
 
-Compile-time cases live in the uncalled `typeContract` function: each `@ts-expect-error` marks a program the types
+Compile-time cases live in uncalled `typeContract` functions: each `@ts-expect-error` marks a program the types
 must reject, and an unused one fails the type check, proving a guard is missing. This is the one allowed use of
 `@ts-` comments.
 

@@ -12,7 +12,9 @@ or the kit's own tests in `test/`.
   Node built-in and no DOM (lint, `test/lint-boundaries.test.ts`).
 - A command acts at most once for whoever sent it, forever (`server/ledger`): claimed in a committed transaction before
   it acts; authorization before any replay; receipts name resources by id and arrive in the pull with the revision that
-  holds their effects. Retention never deletes a key: an old receipt retires and never acts.
+  holds their effects. Retention never deletes a key: an old receipt retires and never acts. Push handlers return
+  per-command receipts and never throw a final-kind refusal after any command in the request has acted; request
+  schema validation runs before the handler.
 - Work the server owes on its own is a job (`server/jobs`): one open per key, claimed and committed before it acts,
   resolved at the next start after a stop, final once finished, `overdue` past its deadline.
 - A replica only moves forward, on disk too (`web/replica`): a commit is decided against the stored checkpoint inside

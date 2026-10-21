@@ -64,7 +64,11 @@ export const pendingSchema = object({
     saving: object({ kind: literal("saving") }),
     queued: object({ kind: literal("queued") }),
     sending: object({ kind: literal("sending") }),
-    unknown: object({ kind: literal("unknown"), failure: string() }),
+    unknown: object({
+      kind: literal("unknown"),
+      failure: string(),
+      parked: optional(literal(true)),
+    }),
     done: object({
       kind: literal("done"),
       outcome: outcomeSchema,
