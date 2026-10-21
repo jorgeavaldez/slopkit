@@ -14,6 +14,7 @@ import type {
   Effect,
   Model,
   Msg,
+  OutboxFull,
   Patch,
   Pending,
   Receipt,
@@ -35,8 +36,14 @@ export type StoragePort<T, S, C, O> = {
    * false` when it took the patch as a delta under its own history (so it lacks rows of this page's copy).
    */
   commit: (commit: Commit<T, S>) => Promise<{ dataset: string; revision: number; whole?: boolean }>;
-  /** Write one command (an intent, or its outcome) under its key. */
-  keep: (pending: Pending<C, O>) => Promise<void>;
+  /**
+   * Write one command (an intent, or its outcome) under its key. A key the outbox doesn't hold yet is admitted only
+   * while it holds fewer than `max` commands (default `OUTBOX_MAX`), decided inside the write's own transaction so
+   * every tab shares the bound; otherwise nothing is written and the store's counts come back. A kept key always
+   * updates, and nothing kept is ever dropped for room.
+   */
+  // oxlint-disable-next-line typescript/no-invalid-void-type -- an adapter that always admits answers like any write
+  keep: (pending: Pending<C, O>, max?: number) => Promise<void | OutboxFull>;
   drop: (keys: { client: string; id: number }[]) => Promise<void>;
 };
 
@@ -195,8 +202,19 @@ export function createClient<T, P, S, C, O>(options: {
         const { client, id } = effect.pending;
 
         return track(
-          ports.storage.keep(effect.pending).then(
-            (): M => ({ type: "kept", client, id, now: now() }),
+          ports.storage.keep(effect.pending, effect.max).then(
+            (kept): M =>
+              kept === undefined
+                ? { type: "kept", client, id, now: now() }
+                : {
+                    type: "full",
+                    client,
+                    id,
+                    waiting: kept.waiting,
+                    finished: kept.finished,
+                    max: kept.max,
+                    now: now(),
+                  },
             (error: unknown): M => ({
               type: "keepFailed",
               client,

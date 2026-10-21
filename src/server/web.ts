@@ -5,7 +5,7 @@
  * from the page's own Origin. Responses carry a strict CSP and no framing.
  *
  * Routes are contract endpoints: the request is checked against its schema before the handler runs and the reply
- * after, so neither side can drift from the contract. Failures answer `{ kind, message }` with the kind's status.
+ * after, so neither side can drift from the contract. Failures answer `{ kind, message, path? }` with the kind's status.
  * The socket is a hint channel: the app sends small messages (pokes, pings); nothing correct depends on it.
  * Every API request is logged with an id, status, time and whether a person or a service asked.
  */
@@ -20,7 +20,7 @@ import { WebSocketServer } from "ws";
 import type { WebSocket } from "ws";
 
 import { STATUS } from "../contract.ts";
-import type { Endpoint, Failure } from "../contract.ts";
+import type { Endpoint, RefusalKind } from "../contract.ts";
 import { Invalid } from "../schema.ts";
 import { WebAuth } from "./auth.ts";
 import type { WebConfig } from "./config.ts";
@@ -51,12 +51,17 @@ export type Caller = {
   request: string;
 };
 
-/** A handler's refusal, answered as a typed failure. */
+/**
+ * A handler's refusal, answered as a typed failure: the kit's error body, so the page can tell it from a proxy's.
+ * `path` names where a request broke its schema (`request.commands[1].command.value`).
+ */
 export class Refusal extends Error {
-  readonly kind: Failure["kind"];
-  constructor(kind: Failure["kind"], message: string) {
+  readonly kind: RefusalKind;
+  readonly path: string | undefined;
+  constructor(kind: RefusalKind, message: string, path?: string) {
     super(message);
     this.kind = kind;
+    this.path = path;
   }
 }
 
@@ -83,7 +88,7 @@ export function route<Req, Res>(
         request = endpoint.request.parse(input, "request");
       } catch (error) {
         if (error instanceof Invalid) {
-          throw new Refusal("invalid", error.message);
+          throw new Refusal("invalid", error.message, error.path);
         }
 
         throw error;
@@ -145,23 +150,44 @@ function send(
 function failure(
   request: IncomingMessage,
   response: ServerResponse,
-  kind: Failure["kind"],
-  message: string
+  kind: RefusalKind,
+  message: string,
+  path?: string
 ): void {
-  send(request, response, STATUS[kind], JSON.stringify({ kind, message }), {
-    "content-type": "application/json",
-  });
+  send(
+    request,
+    response,
+    STATUS[kind],
+    JSON.stringify({ kind, message, ...(path === undefined ? {} : { path }) }),
+    { "content-type": "application/json" }
+  );
 }
 
+/**
+ * The body as JSON: its bytes collected and counted against `limit`, then decoded once, so a character split between
+ * chunks arrives whole. Bytes that aren't UTF-8 are refused, never replaced.
+ */
 async function readBody(request: IncomingMessage, limit: number): Promise<unknown> {
-  let text = "";
+  const chunks: Buffer[] = [];
+  let size = 0;
 
   for await (const chunk of request) {
-    text += String(chunk);
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += bytes.length;
 
-    if (text.length > limit) {
+    if (size > limit) {
       throw new Refusal("invalid", "the request is too large");
     }
+
+    chunks.push(bytes);
+  }
+
+  let text: string;
+
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+  } catch {
+    throw new Refusal("invalid", "the request is not UTF-8");
   }
 
   try {
@@ -184,7 +210,7 @@ export type WebOptions = {
   socket?: Socket;
   /** The session cookie's name. */
   cookie: string;
-  /** Request bodies past this are refused; default 64 KB. */
+  /** Request bodies past this many bytes are refused; default 64 KiB. Give a push endpoint `PUSH_BYTES` or more. */
   bodyLimit?: number;
 };
 
@@ -332,7 +358,8 @@ export async function serveWeb(
         request,
         response,
         kind,
-        error instanceof Refusal ? message : "the server failed; see its log"
+        error instanceof Refusal ? message : "the server failed; see its log",
+        error instanceof Refusal ? error.path : undefined
       );
     }
 
