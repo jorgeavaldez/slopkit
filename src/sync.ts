@@ -303,6 +303,8 @@ export type Spec<T, P, S, C, O> = {
    * until it resolves or the person dismisses it. Default: every outcome is resolved.
    */
   resolved?: (pending: Pending<C, O>, model: Model<T, S, C, O>) => boolean;
+  /** The most commands one push carries: the push endpoint's own bound. Default `PUSH_MAX`. */
+  pushMax?: number;
 };
 
 /** The socket must be heard this often (the server pokes every 20 s); quieter, the page polls. */
@@ -314,6 +316,9 @@ const BACKOFF_MAX_MS = 30_000;
 
 /** Storage gets this long to load, or to keep an intent, before the page goes on without it. */
 export const STORAGE_DEADLINE_MS = 3000;
+
+/** Commands per push unless the spec says otherwise; the rest wait for the next push. */
+export const PUSH_MAX = 50;
 
 /** Settled commands stay drawn this long. */
 export const DONE_KEEP_MS = 60_000;
@@ -411,6 +416,12 @@ function failedConnection(connection: Connection, failure: Failure): Connection 
 }
 
 export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
+  const pushMax = spec.pushMax ?? PUSH_MAX;
+
+  if (!Number.isSafeInteger(pushMax) || pushMax < 1) {
+    throw new Error(`sync: pushMax must be a positive integer, got ${pushMax}`);
+  }
+
   type M = Model<T, S, C, O>;
 
   type E = Effect<T, S, C, O>;
@@ -543,6 +554,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
       if (first !== undefined) {
         // One push per client, dataset and tapped-against revision: the server judges each by what it was made on.
+        // At most `pushMax`, oldest first; the rest go in the next push.
         const tapped = (each: Pending<C, O>) => each.since ?? next.replica.revision;
 
         const ids = new Set(
@@ -554,6 +566,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
                 tapped(each) === tapped(first) &&
                 (each.state.kind === "queued" || each.state.kind === "unknown")
             )
+            .slice(0, pushMax)
             .map((each) => each.id)
         );
 

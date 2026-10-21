@@ -80,7 +80,7 @@ Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs th
 2. An action produces a durable keep first; only its completion permits sending.
 3. A fingerprint result for revision N can't certify revision N+1.
 
-### Client executor (`client.test.ts`, `push-since.test.ts`)
+### Client executor (`client.test.ts`, `push-since.test.ts`, `push-batch.test.ts`)
 
 1. Nothing reaches the network before the intent's transaction commits.
 2. An aborted intent transaction produces a visible refusal and no effect.
@@ -96,6 +96,8 @@ Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs th
    stays 17 through slow storage, a newer pull, reload and retry. A push never mixes clients, datasets or `since`
    values. A legacy outbox entry without `since` takes the revision loaded with it from disk, before any newer pull or
    reset.
+9. A push carries at most `pushMax` commands (default `PUSH_MAX`, 50), oldest first: 120 kept commands go out as
+   pushes of 50, 50 and 20, each command once, and every one reaches an outcome.
 
 ### Pure view
 
