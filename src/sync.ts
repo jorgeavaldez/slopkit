@@ -19,7 +19,8 @@
  * - **Only a complete copy is checked.** No fingerprint is asked for or compared while the copy is partial.
  * - **A chunk costs its own size.** Merging a reply doesn't copy the tables it lands in (`Layered`).
  * - **Observed is not saved.** `saved` is what the disk is known to hold; a failed commit is retried whole until the
- *   disk catches up, and until then the page says so.
+ *   disk catches up (a later page the disk takes as a delta under its own history doesn't), and until then the page
+ *   says so.
  * - **A pull is owed while the server is ahead.** `target` is the newest revision the server is known to have (pokes,
  *   which also beat every 20 s, push replies, receipts); while the replica is behind it a pull is in flight or
  *   scheduled, whatever the socket says. Liveness, the known head and the last reconciliation are separate facts.
@@ -27,7 +28,8 @@
  *   earlier page keep theirs.
  * - **Nothing is sent before it is kept.** An intent the device can't keep fails at once, visibly, and is never sent.
  * - **Every command reaches an outcome, and is settled only once the replica holds its effects** (a receipt names the
- *   revision that made it visible); until then a pull is owed.
+ *   revision that made it visible; on a partial copy, only a pull reply that carried the receipt, with the rows it
+ *   names, settles it); until then a pull is owed, and names the commands it waits on, any page's.
  * - **Every waiting state ends.** Pulling, pushing, retrying and saving have deadlines or backoff; storage that is slow
  *   to load or keep is said (the page goes on from the server meanwhile), and its late answer still counts: a slow
  *   write is not a failed one.
@@ -149,9 +151,10 @@ class Layered<K, V> implements ReadonlyMap<K, V> {
     return this.entries();
   }
 
-  forEach(each: (value: V, key: K, map: ReadonlyMap<K, V>) => void): void {
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- Map's receiver is whatever the caller passes
+  forEach(each: (value: V, key: K, map: ReadonlyMap<K, V>) => void, receiver?: unknown): void {
     for (const [key, value] of this.entries()) {
-      each(value, key, this);
+      each.call(receiver, value, key, this);
     }
   }
 }
@@ -296,8 +299,11 @@ const covered = (page: Page | undefined): History =>
         total: page.total,
       };
 
-/** A command's outcome as the server recorded it, and the revision at which its effects are visible. */
-export type Receipt<O> = { id: number; outcome: O; revision: number };
+/**
+ * A command's outcome as the server recorded it, and the revision at which its effects are visible. `client` names an
+ * earlier page's command (absent: the pull's or push's own client).
+ */
+export type Receipt<O> = { id: number; outcome: O; revision: number; client?: string };
 
 export type CommandState<O> =
   | { kind: "saving" }
@@ -348,6 +354,11 @@ export type Model<T, S, C, O> = {
     writing: number;
     failures: number;
     nextAt: number;
+    /**
+     * A write failed and only a whole one (or one the disk took whole) repairs it: a later page landing as a delta
+     * doesn't, since the disk still lacks the failed page's rows.
+     */
+    owed: boolean;
   };
   target: number;
   /**
@@ -366,6 +377,8 @@ export type Model<T, S, C, O> = {
     | { kind: "idle"; nextAt: number; failures: number }
     | { kind: "pushing"; client: string; ids: readonly number[]; failures: number };
   commands: readonly Pending<C, O>[];
+  /** Commands (`client:id`) whose receipt came in a pull reply this copy applied, so with the rows it names. */
+  carried: ReadonlySet<string>;
   /** Commands an earlier page kept that this version can't read: left on disk, and said. */
   unreadable: number;
   visible: boolean;
@@ -400,8 +413,11 @@ export type Msg<T, P, S, C, O> =
       now: number;
     }
   | { type: "pushFailed"; client: string; ids: number[]; failure: Failure; now: number }
-  /** The disk holds the replica at `revision` (perhaps newer than asked, from another tab). */
-  | { type: "committed"; dataset: string; revision: number; now: number }
+  /**
+   * The disk holds the replica at `revision` (perhaps newer than asked, from another tab); `whole: false` when it took
+   * the patch as a delta under its own, other history.
+   */
+  | { type: "committed"; dataset: string; revision: number; whole?: boolean; now: number }
   | { type: "commitFailed"; reason: string; replaced: boolean; now: number }
   | { type: "kept"; client: string; id: number; now: number }
   | { type: "keepFailed"; client: string; id: number; reason: string; now: number }
@@ -440,6 +456,8 @@ export type Effect<T, S, C, O> =
       verify: boolean;
       /** The older page wanted (null: none, but a paged reset is understood); absent asks an old server's whole reply. */
       page?: string | null;
+      /** Commands still waiting on an outcome or on their effects, any page's: their receipts come with their rows. */
+      commands: { client: string; id: number }[];
     }
   | {
       kind: "push";
@@ -507,9 +525,18 @@ export function reachable(connection: Connection): boolean {
   return connection.kind === "live" || connection.kind === "stale";
 }
 
-/** Whether the replica holds this command's effects. */
+/**
+ * Whether the replica holds this command's effects: it is done, and the copy is at its revision and either complete or
+ * holding the rows its receipt names (a pull reply carried them). One that failed on the page has none.
+ */
 export function settled<T, S, C, O>(model: Model<T, S, C, O>, pending: Pending<C, O>): boolean {
-  return pending.state.kind === "done" && model.replica.revision >= pending.state.revision;
+  return (
+    pending.state.kind === "done" &&
+    (pending.state.revision === 0 ||
+      (model.replica.revision >= pending.state.revision &&
+        (historyOf(model.replica).kind === "complete" ||
+          model.carried.has(`${pending.client}:${pending.id}`))))
+  );
 }
 
 /**
@@ -520,7 +547,7 @@ export function saved<T, S, C, O>(model: Model<T, S, C, O>): boolean {
   return (
     model.saved.dataset === model.replica.dataset &&
     model.saved.revision >= model.replica.revision &&
-    model.saved.failures === 0
+    !model.saved.owed
   );
 }
 
@@ -706,6 +733,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
         writing: 0,
         failures: 0,
         nextAt: now,
+        owed: false,
       },
       target: 0,
       restart: null,
@@ -715,6 +743,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       pull: { kind: "idle", nextAt: now, failures: 0 },
       push: { kind: "idle", nextAt: now, failures: 0 },
       commands: [],
+      carried: new Set(),
       unreadable: 0,
       visible: true,
       verify: { kind: "pending", tries: 0 },
@@ -750,7 +779,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       return "gap";
     } else if (
       patch.revision < replica.revision ||
-      (patch.revision === replica.revision && page === undefined)
+      (patch.revision === replica.revision && (page === undefined || was.kind === "complete"))
     ) {
       // Nothing newer, but the server's own facts (version, settings) may have moved.
       return patch.revision === replica.revision &&
@@ -811,6 +840,20 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       const since = next.restart === null ? next.replica.revision : 0;
 
       if ((owed && (failures === 0 || due)) || (polling && due)) {
+        const current = next;
+
+        // Commands waiting on an outcome or on their effects, oldest first, at most a push's worth: their receipts
+        // come back with the rows they name; the rest in the next pull.
+        const commands = current.commands
+          .filter(
+            (each) =>
+              each.state.kind === "sending" ||
+              each.state.kind === "unknown" ||
+              (each.state.kind === "done" && !settled(current, each))
+          )
+          .slice(0, pushMax)
+          .map((each) => ({ client: each.client, id: each.id }));
+
         out.push({
           kind: "pull",
           client: next.client,
@@ -818,6 +861,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
           since,
           verify: verifying,
           ...(whole ? {} : { page: history.kind === "partial" && since > 0 ? history.next : null }),
+          commands,
         });
         next = {
           ...next,
@@ -1028,19 +1072,41 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
         const history = historyOf(replica);
         const failures = at.pull.kind === "pulling" ? at.pull.failures : 0;
 
-        // A partial copy this reply didn't move on (the same page again, a repeated first page, a reply it couldn't
-        // take) is a pull that failed, for backoff: never a busy loop on a server that doesn't move.
+        // An old server answering a partial copy (with rows or without): only its whole copy completes it.
+        const old =
+          was.kind === "partial" &&
+          msg.patch.page === undefined &&
+          !msg.patch.reset &&
+          msg.since > 0 &&
+          result !== "gap";
+
+        // A partial copy this reply didn't move on (the same page again, a repeated first page at the same revision, a
+        // reply it couldn't take) is a pull that failed, for backoff: never a busy loop on a server that doesn't move.
         const stuck =
           was.kind === "partial" &&
+          !old &&
           (merged === undefined ||
             (msg.patch.page !== undefined &&
               history.kind === "partial" &&
               history.next === was.next &&
-              replica.dataset === at.replica.dataset));
+              replica.dataset === at.replica.dataset &&
+              !(merged.reset && replica.revision > at.replica.revision)));
+
+        // Receipts that came with an applied reply came with the rows they name.
+        const carried = new Set(merged?.reset === true ? [] : at.carried);
+
+        if (merged !== undefined) {
+          for (const each of msg.receipts) {
+            if (each.revision <= replica.revision) {
+              carried.add(`${each.client ?? at.client}:${each.id}`);
+            }
+          }
+        }
 
         let next: M = {
           ...at,
           replica,
+          carried,
           target:
             msg.patch.dataset === at.replica.dataset
               ? Math.max(at.target, msg.patch.revision)
@@ -1051,7 +1117,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
               ? (at.restart ?? "paged")
               : merged?.reset === true
                 ? null
-                : history.kind === "partial" && merged !== undefined && msg.patch.page === undefined
+                : old
                   ? "whole"
                   : at.restart,
           reconciledAt: now,
@@ -1092,7 +1158,20 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
           }
         }
 
-        const [answered, more] = answer(next, next.client, msg.receipts);
+        // Receipts by client: an earlier page's commands are answered too.
+        let answered = next;
+        const more: E[] = [];
+
+        for (const client of new Set(msg.receipts.map((each) => each.client ?? at.client))) {
+          const [after, told] = answer(
+            answered,
+            client,
+            msg.receipts.filter((each) => (each.client ?? at.client) === client)
+          );
+
+          answered = after;
+          more.push(...told);
+        }
 
         // Intents tapped against a store the server no longer has never go to its replacement (the server refuses
         // them too). One that may already have run there says so.
@@ -1205,11 +1284,13 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
       case "committed": {
         const same = msg.dataset === at.saved.dataset;
+        // A delta the disk took under its own history doesn't repair a failed write: the whole one stays owed.
+        const owed = at.saved.owed && msg.whole === false;
 
         return [
           {
             ...at,
-            storage: at.storage.kind === "replaced" ? at.storage : { kind: "ok" },
+            storage: at.storage.kind === "replaced" || owed ? at.storage : { kind: "ok" },
             saved: {
               dataset: msg.dataset,
               revision: same ? Math.max(at.saved.revision, msg.revision) : msg.revision,
@@ -1217,6 +1298,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
               writing: Math.max(0, at.saved.writing - 1),
               failures: 0,
               nextAt: now,
+              owed,
             },
           },
           [],
@@ -1235,6 +1317,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
               writing: Math.max(0, at.saved.writing - 1),
               failures,
               nextAt: now + backoff(failures),
+              owed: true,
             },
           },
           [{ kind: "telemetry", name: "replica.save-failed", attributes: { reason: msg.reason } }],
@@ -1476,6 +1559,14 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       since === next.saved.behindSince
         ? next
         : { ...next, saved: { ...next.saved, behindSince: since } };
+
+    // Commands that left the page leave what was carried for them.
+    const kept = new Set(marked.commands.map((each) => `${each.client}:${each.id}`));
+    const carried = [...marked.carried].filter((key) => kept.has(key));
+
+    if (carried.length < marked.carried.size) {
+      marked = { ...marked, carried: new Set(carried) };
+    }
 
     // A command that resolves only now (its result came later than its receipt) is drawn its full time from now.
     const resolved = spec.resolved;

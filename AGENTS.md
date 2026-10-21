@@ -26,11 +26,14 @@ or the kit's own tests in `test/`.
 - A copy never claims more history than it holds (`sync`): complete, or partial with every row at or above its cursor
   and `through`. A delta applies only when `since ≤ copy.revision ≤ reply.revision` on the same dataset; only a reset
   replaces the copy; the cursor moves only on a reply to the copy's own `next`; a partial copy owes its next page, with
-  backoff when a reply doesn't move it on, and is never checked against a fingerprint until complete.
+  backoff when a reply doesn't move it on, and is never checked against a fingerprint until complete. On a partial
+  copy a command settles only once a pull reply carrying its receipt (and so its rows) is applied; a pull names the
+  commands it waits on. A failed write stays owed until a write the disk takes whole repairs it.
 - No paging-aware pull reply is unbounded (`server/pull`): one read transaction, keyset cursors scoped to the dataset
   and the order's version (never an offset or the anchor's current row), rows and encoded bytes within the app's caps,
   an oversized delta answered as a paged reset, `through` only over whole order groups, and every row a receipt names in
-  the reply that carries it. A request without `page` keeps the whole reply of before.
+  the reply that carries it. A reply that can't fit is refused, never sent over the caps. A request without `page`
+  keeps the whole reply of before.
 - Every untrusted boundary is checked by a schema (`schema`); nothing is coerced. Money is safe-integer minor units.
 - Replicated rows carry the current revision and are never deleted (tombstones), by trigger, not habit.
 - What a screen says is decided by tables (`states`): a subject's states are a closed union and its table places
