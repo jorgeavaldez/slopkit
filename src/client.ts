@@ -43,6 +43,11 @@ export type NetworkPort<P, S, C, O> = {
     dataset: string | null;
     since: number;
     verify: boolean;
+    /**
+     * The older page wanted: null for none (a paged reset is understood), the copy's `next` while partial. Absent asks
+     * for an old server's whole reply.
+     */
+    page?: string | null;
   }) => Promise<Result<{ patch: Patch<P, S>; receipts: Receipt<O>[] }>>;
   push: (request: {
     client: string;
@@ -117,6 +122,7 @@ export function createClient<T, P, S, C, O>(options: {
               dataset: effect.dataset,
               since,
               verify: effect.verify,
+              ...(effect.page === undefined ? {} : { page: effect.page }),
             })
             .then(
               (result): M =>

@@ -11,7 +11,11 @@
  * - Rows are read back only under the row shapes that wrote them (each table's name and schema `shape`, kept with the
  *   checkpoint): any change to a table or its schema starts the rows over, with no number to bump by hand. The next
  *   commit then writes the whole replica, so the disk is repaired, not just the memory. Rows that don't parse are
- *   treated the same. The server's facts are not rows: facts an older page kept that no longer fit load as null and
+ *   treated the same.
+ * - A partial copy (a first copy still paging in) keeps its history in the checkpoint, written in the same transaction
+ *   as its rows, and marks its row shapes as partial: a release from before paging reads it as another release's copy,
+ *   so it never takes part of a history for all of it. A delta takes the patch's history only when the disk is at the
+ *   cursor the patch moved from, and a complete copy at a revision is never narrowed to a partial one. The server's facts are not rows: facts an older page kept that no longer fit load as null and
  *   never cost the copy; facts that change at the same revision are written too.
  * - A version upgrade starts the replica over (it comes back from the server) but keeps the outbox and the generation:
  *   an intent on disk is never erased by an upgrade. One this version can't read stays on disk and is counted.
@@ -22,20 +26,37 @@
  */
 import { Replaced } from "../client.ts";
 import type { StoragePort } from "../client.ts";
-import { check } from "../schema.ts";
+import { check, literal, nullable, number, object, string } from "../schema.ts";
 import type { Schema } from "../schema.ts";
 import { commitPlan } from "../sync.ts";
-import type { Lens, Op, Pending, Replica } from "../sync.ts";
+import type { History, Lens, Op, Pending, Replica } from "../sync.ts";
 import { committed, openDatabase, request } from "./idb.ts";
 
-/** Which dataset a copy holds, and at what revision (0 before any). */
-type Position = { dataset: string | null; revision: number };
+/** Which dataset a copy holds, at what revision (0 before any), and how much of its history. */
+type Position = { dataset: string | null; revision: number; history: History };
 
-type Checkpoint<S> = Position & {
+type Checkpoint<S> = Omit<Position, "history"> & {
+  /** Kept only while partial: a complete checkpoint reads as it did before paging. */
+  history?: History;
   server: S | null;
-  /** The row shapes that wrote the rows (`Lens.shape`, every table): read back only under the same ones. */
+  /**
+   * The row shapes that wrote the rows (`Lens.shape`, every table): read back only under the same ones. A partial
+   * copy's are marked, so a release that can't page doesn't read them.
+   */
   shapes: string;
 };
+
+const COMPLETE: History = { kind: "complete" };
+
+const count = () => number({ integer: true, min: 0 });
+
+const partialSchema = object({
+  kind: literal("partial"),
+  next: string(),
+  through: nullable(string()),
+  held: count(),
+  total: count(),
+});
 
 export function indexedReplica<T, P, S, C, O>(options: {
   factory: IDBFactory;
@@ -55,6 +76,9 @@ export function indexedReplica<T, P, S, C, O>(options: {
 }): StoragePort<T, S, C, O> & { forget: () => Promise<void> } {
   const names = options.tables.map((lens) => lens.name);
   const shapes = options.tables.map((lens) => lens.shape).join("\n");
+  /** A partial copy's row shapes: foreign to a release from before paging. */
+  const partialShapes = `${shapes}\npartial`;
+  const ours = (written: unknown) => written === shapes || written === partialShapes;
   /** The checkpoint a load found whose rows didn't parse: the next commit at it rewrites the whole replica. */
   let damaged: { dataset: string | null; revision: number } | undefined;
   /** The dataset of a copy this page loaded but couldn't read (other row shapes, rows that don't parse): its own to replace. */
@@ -199,20 +223,25 @@ export function indexedReplica<T, P, S, C, O>(options: {
 
   /** The checkpoint on disk as this version may trust it: one of other row shapes (or none) holds nothing. */
   const checkpointOf = (value: unknown): Position => {
+    const none = { dataset: null, revision: 0, history: COMPLETE };
+
     if (typeof value !== "object" || value === null) {
-      return { dataset: null, revision: 0 };
+      return none;
     }
 
     const dataset: unknown = Reflect.get(value, "dataset");
     const revision: unknown = Reflect.get(value, "revision");
+    const written: unknown = Reflect.get(value, "shapes");
+    const partial = check(partialSchema, Reflect.get(value, "history"));
 
-    if (Reflect.get(value, "shapes") !== shapes) {
-      return { dataset: null, revision: 0 };
+    if (written !== shapes && (written !== partialShapes || !partial.ok)) {
+      return none;
     }
 
     const at = {
       dataset: typeof dataset === "string" ? dataset : null,
       revision: typeof revision === "number" ? revision : 0,
+      history: written === partialShapes && partial.ok ? partial.value : COMPLETE,
     };
 
     if (
@@ -220,7 +249,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
       damaged.dataset === at.dataset &&
       damaged.revision === at.revision
     ) {
-      return { dataset: null, revision: 0 };
+      return none;
     }
 
     return at;
@@ -277,6 +306,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
         revision: 0,
         tables: options.empty,
         server: null,
+        history: COMPLETE,
       };
 
       const at = checkpointOf(point);
@@ -323,6 +353,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
           revision: at.revision,
           tables: restored,
           server: server?.ok === true ? server.value : null,
+          history: at.history,
         },
         commands,
         unreadable,
@@ -335,11 +366,10 @@ export function indexedReplica<T, P, S, C, O>(options: {
       const done = committed(transaction);
       const meta = transaction.objectStore("meta");
 
-      const target: Checkpoint<S> = {
+      const target = {
         dataset: commit.replica.dataset,
         revision: commit.replica.revision,
         server: commit.replica.server,
-        shapes,
       };
 
       try {
@@ -368,6 +398,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
           reset: commit.reset,
           base: commit.base,
           replaces: commit.replaces,
+          ...(commit.from === undefined ? {} : { from: commit.from }),
         });
 
         // The disk holds a dataset this page never saw: the server replaced the one this page is on.
@@ -386,7 +417,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
         // the copy now, at any revision, and this page stops writing until it reloads.
         if (
           held === commit.replica.dataset &&
-          written !== shapes &&
+          !ours(written) &&
           (loaded === undefined ||
             loaded.dataset !== held ||
             loaded.revision !== revision ||
@@ -418,7 +449,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
           }
         };
 
-        if (plan === "delta") {
+        if (plan === "delta" || plan === "adopt") {
           write(commit.ops);
         }
 
@@ -435,8 +466,19 @@ export function indexedReplica<T, P, S, C, O>(options: {
         // At the same revision the rows are already there, but the server's facts may have moved: they are kept too.
         const facts = plan === "skip" && stored.revision === target.revision;
 
+        // A delta keeps the disk's history; a whole write or a delta from the disk's own cursor takes the page's.
+        const history =
+          plan === "whole" || plan === "adopt"
+            ? (commit.replica.history ?? COMPLETE)
+            : stored.history;
+
+        const checkpoint: Checkpoint<S> = {
+          ...target,
+          ...(history.kind === "partial" ? { history, shapes: partialShapes } : { shapes }),
+        };
+
         if (plan !== "skip" || facts) {
-          meta.put(target, "checkpoint");
+          meta.put(checkpoint, "checkpoint");
         }
 
         options.interfere?.("commit", transaction);
@@ -448,7 +490,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
           loaded = undefined;
         }
 
-        const now = plan === "skip" ? stored : target;
+        const now = plan === "skip" ? stored : checkpoint;
 
         if (now.dataset === null) {
           throw new Error("the replica has no dataset");

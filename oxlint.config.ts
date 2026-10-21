@@ -50,6 +50,7 @@ export default defineConfig({
         "src/server/auth.ts",
         "src/server/config.ts",
         "src/server/ledger.ts",
+        "src/server/pull.ts",
         "src/server/web.ts",
         "src/web/replica.ts",
         "scripts/pack-check.ts",
