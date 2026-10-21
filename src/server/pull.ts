@@ -19,6 +19,10 @@
  *   to the rows and bytes it leaves, and with no room at all the cursor stays where it was. A reset carries one row of history at least, then as many receipts as fit, then more rows; one
  *   that can't fit even so (the other tables alone are over the caps) is never sent: `pull` throws, a server fault
  *   the page sees as unavailable and retries.
+ * - **A reply costs about one encoding.** Each candidate is measured, not built: the reply as `respond` makes it with no
+ *   rows, plus each row's own encoding (every row read and encoded once) and a comma between rows; counts run once per
+ *   reply, and a candidate's coverage is read from the rows it fetched. The chosen reply is built once, and checked: one
+ *   whose bytes aren't its rows' (a `respond` that reshapes rows) is chosen again by building each candidate whole.
  * - **Receipts carry their rows.** A row a receipt names is in the reply that carries the receipt, even below the page,
  *   so a command settles only on a copy that holds its effects. A paging client names the commands it waits on (any of
  *   its pages', at most a push's worth); a receipt left out for room is asked for again by its next pull.
@@ -196,6 +200,10 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
   const encode = (dataset: string, row: Row) =>
     JSON.stringify([dataset, paged.version, ...values(row, order)]);
 
+  /** Whether a row is in the order group `at`. */
+  const same = (row: Row, at: readonly (string | number)[]) =>
+    values(row, group).every((value, index) => value === at[index]);
+
   /** A cursor's order values, or undefined for one this history can't honour. */
   function decode(text: string, dataset: string): (string | number)[] | undefined {
     let parsed: unknown;
@@ -222,31 +230,6 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
     )
       ? at.filter((value) => typeof value === "string" || typeof value === "number")
       : undefined;
-  }
-
-  /** Where a page ending at `last` leaves the copy, at this revision. */
-  function place(dataset: string, from: string | null, last: Row | undefined, more: boolean): Page {
-    const total = tally(sql.total.get());
-
-    if (last === undefined || !more) {
-      return { from, next: null, through: null, held: total, total };
-    }
-
-    const at = values(last, group);
-    const split = sql.split.get(...at, ...values(last, [key])) !== undefined;
-    const above = split ? sql.above.get(...at) : undefined;
-
-    return {
-      from,
-      next: encode(dataset, last),
-      through: split
-        ? above === undefined
-          ? null
-          : paged.through(Object.values(above))
-        : paged.through(at),
-      held: tally(sql.held.get(...values(last, order))),
-      total,
-    };
   }
 
   function assemble(request: PullAsk, receipts: (since: number) => readonly Rc[]) {
@@ -283,90 +266,240 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
       });
     }
 
+    // Counted once per reply: every candidate page is placed from these and from the rows it was read with.
+    let total: number | undefined;
+    const count = () => (total ??= tally(sql.total.get()));
+    const above = new Map<string, (string | number)[] | null>();
+
+    /** The lowest live order group above `at` (whole, so its values are the coverage boundary), once per group. */
+    const higher = (at: (string | number)[]) => {
+      const id = JSON.stringify(at);
+
+      if (!above.has(id)) {
+        const found = sql.above.get(...at);
+        above.set(id, found === undefined ? null : values(found, group));
+      }
+
+      return above.get(id) ?? null;
+    };
+
+    /** Each row read and encoded once, by key: a row is the same everywhere in one reply (one transaction). */
+    const encoded = new Map<SQLOutputValue | undefined, { value: R; bytes: number }>();
+
+    const row = (each: Row) => {
+      let found = encoded.get(each[key]);
+
+      if (found === undefined) {
+        const value = paged.read(each);
+        found = { value, bytes: Buffer.byteLength(JSON.stringify(value)) };
+        encoded.set(each[key], found);
+      }
+
+      return found;
+    };
+
     /**
-     * A reply: `size` rows of `page` (fetched with one row more, to know if older ones are left), the first `count` of
-     * `kept` receipts with the rows they name, and `extra` history rows beside them; once each, as the store holds
-     * them now. Says whether it fits the caps, and how many rows it carries.
+     * A reply: `size` rows of `page` (fetched with one row more, to know if older ones are left, and live rows strictly
+     * below the cursor `fixed.at`, or the newest ones), the first `count` of `kept` receipts with the rows they name,
+     * and `extra` history rows beside them; once each, as the store holds them now. `held` counts the rows at or
+     * above the cursor (none on a reset). `measure` says whether one fits the caps without building it: the reply as
+     * `respond` makes it with no rows, plus each row's own encoded bytes and a comma between rows. `make` builds it.
      */
     const reply = (
       fixed: { reset: boolean; from: string | null; unpaged: U; at?: Row },
       page: Row[],
       kept: readonly Rc[],
-      extra: Row[]
+      extra: Row[],
+      held: () => number
     ) => {
       const named = kept.map((each) =>
         options.receipts.names(each).flatMap((name) => sql.named.all(name))
       );
 
-      return (size: number, count = kept.length) => {
-        const rows = new Map<SQLOutputValue | undefined, Row>();
+      /**
+       * Where a page of `size` rows leaves the copy: its last row (or the cursor), whether a live row of its group
+       * lies below it (the next row fetched), the group above it (in the page, else one query), and `held`.
+       */
+      const place = (size: number): Page => {
+        const last = page[size - 1] ?? fixed.at;
+        const next = page[size];
 
-        for (const row of [...page.slice(0, size), ...extra, ...named.slice(0, count).flat()]) {
-          rows.set(row[key], rows.get(row[key]) ?? row);
+        if (last === undefined || next === undefined) {
+          return { from: fixed.from, next: null, through: null, held: count(), total: count() };
         }
 
-        const made = answer({
-          ...base,
-          ...fixed,
-          rows: [...rows.values()].map(paged.read),
-          receipts: kept.slice(0, count),
-          page: place(dataset, fixed.from, page[size - 1] ?? fixed.at, page.length > size),
-        });
+        const at = values(last, group);
+        let through: (string | number)[] | null = at;
 
-        const carried = rows.size + sizeOf(fixed.unpaged);
+        // A page ending inside a group leaves it out: the boundary is the lowest whole group above.
+        if (same(next, at)) {
+          const inPage = page.slice(0, Math.max(0, size - 1)).findLast((each) => !same(each, at));
+          through = inPage === undefined ? higher(at) : values(inPage, group);
+        }
 
-        return { made, carried, fits: carried <= limits.maxRows && made.bytes <= limits.maxBytes };
+        return {
+          from: fixed.from,
+          next: encode(dataset, last),
+          through: through === null ? null : paged.through(through),
+          held: held() + size,
+          total: count(),
+        };
+      };
+
+      const rows = (size: number, taken: number) => {
+        const out = new Map<SQLOutputValue | undefined, Row>();
+
+        for (const each of [...page.slice(0, size), ...extra, ...named.slice(0, taken).flat()]) {
+          out.set(each[key], out.get(each[key]) ?? each);
+        }
+
+        return [...out.values()];
+      };
+
+      const pulled = (size: number, taken: number, carried: R[]): Pulled<R, U, Rc> => ({
+        ...base,
+        ...fixed,
+        rows: carried,
+        receipts: kept.slice(0, taken),
+        page: place(size),
+      });
+
+      const fits = (carried: number, bytes: number) =>
+        carried + sizeOf(fixed.unpaged) <= limits.maxRows && bytes <= limits.maxBytes;
+
+      return {
+        /** The rows fetched for the page, one more than it may carry when older ones are left. */
+        fetched: page.length,
+        receipts: kept.length,
+        /** The reply's encoded bytes and whether it fits, from its rows' own encodings. */
+        measure: (size: number, taken = kept.length) => {
+          const carried = rows(size, taken);
+          let bytes = answer(pulled(size, taken, [])).bytes + Math.max(0, carried.length - 1);
+
+          for (const each of carried) {
+            bytes += row(each).bytes;
+          }
+
+          return { bytes, fits: fits(carried.length, bytes) };
+        },
+        /** The reply itself, and whether it fits, encoded whole. */
+        make: (size: number, taken = kept.length) => {
+          const carried = rows(size, taken);
+
+          const made = answer(
+            pulled(
+              size,
+              taken,
+              carried.map((each) => row(each).value)
+            )
+          );
+
+          return { made, fits: fits(carried.length, made.bytes) };
+        },
       };
     };
 
-    if (!reset) {
-      const unpaged = options.unpaged(since);
-      const room = cursor === null ? 0 : limits.pageRows;
-      const page = cursor === null ? [] : sql.older.all(...cursor, room + 1);
+    type Built = ReturnType<typeof reply>;
 
-      // The cursor as the row it stands for: a reply with no older row leaves the copy there.
-      const at =
-        cursor === null
-          ? {}
-          : {
-              at: Object.fromEntries(order.map((column, index) => [column, cursor[index] ?? null])),
-            };
+    /** A delta's reply, and the newest page's: each read once, when first asked for. */
+    let delta: Built | undefined;
+    let fresh: Built | undefined;
 
-      const build = reply(
-        { reset: false, from: request.page, unpaged, ...at },
-        page,
-        receipts(since),
-        sql.changes.all(since)
-      );
+    const forDelta = () => {
+      if (delta === undefined) {
+        const unpaged = options.unpaged(since);
+        const room = cursor === null || cursor === undefined ? 0 : limits.pageRows;
+        const page = room === 0 ? [] : sql.older.all(...(cursor ?? []), room + 1);
+        let held: number | undefined;
 
-      const alone = build(0);
+        // The cursor as the row it stands for: a reply with no older row leaves the copy there.
+        const at =
+          cursor === null || cursor === undefined
+            ? {}
+            : {
+                at: Object.fromEntries(
+                  order.map((column, index) => [column, cursor[index] ?? null])
+                ),
+              };
 
-      // Only a delta (with its receipts' rows and the other tables) that can't fit by itself starts the copy over; the
-      // older page takes the rows and bytes it leaves.
-      if (alone.fits) {
-        const most = Math.min(room, page.length, limits.maxRows - alone.carried);
-
-        return build(largest(1, most, (size) => build(size).fits) ?? 0).made;
+        delta = reply(
+          { reset: false, from: request.page ?? null, unpaged, ...at },
+          page,
+          receipts(since),
+          sql.changes.all(since),
+          // The live rows at or above the cursor: with the page's own rows, every row at or above its last.
+          () => (held ??= cursor ? tally(sql.held.get(...cursor)) : 0)
+        );
       }
-    }
 
-    // Everything, from the newest page: one row of it at least, then as many receipts (with their rows) as fit, then
-    // as many more of the first rows. A receipt left out is asked for again by the next pull.
-    const kept = receipts(0);
-    const page = sql.top.all(limits.firstRows + 1);
-    const least = Math.min(1, page.length);
-    const build = reply({ reset: true, from: null, unpaged: options.unpaged(0) }, page, kept, []);
-    const count = largest(0, kept.length, (at) => build(least, at).fits);
+      return delta;
+    };
 
-    if (count === undefined) {
-      throw new Error(
-        `pull: the reply can't fit its caps (${limits.maxRows} rows, ${limits.maxBytes} bytes), even with one row of history`
+    const forReset = () => {
+      fresh ??= reply(
+        { reset: true, from: null, unpaged: options.unpaged(0) },
+        sql.top.all(limits.firstRows + 1),
+        receipts(0),
+        [],
+        () => 0
       );
+
+      return fresh;
+    };
+
+    /**
+     * The reply's shape by `fits`: a delta that fits by itself takes the older page's rows and bytes it leaves;
+     * otherwise everything, from the newest page: one row of it at least, then as many receipts (with their rows) as
+     * fit, then as many more of the first rows. A receipt left out is asked for again by the next pull.
+     */
+    const choose = (fits: (built: Built, size: number, taken?: number) => boolean) => {
+      if (!reset) {
+        const built = forDelta();
+
+        // Only a delta (with its receipts' rows and the other tables) that can't fit by itself starts the copy over.
+        if (fits(built, 0)) {
+          const room = cursor === null ? 0 : limits.pageRows;
+          const most = Math.min(room, built.fetched);
+
+          return {
+            built,
+            size: largest(1, most, (size) => fits(built, size)) ?? 0,
+            receipts: built.receipts,
+          };
+        }
+      }
+
+      const built = forReset();
+      const least = Math.min(1, built.fetched);
+      const kept = largest(0, built.receipts, (at) => fits(built, least, at));
+
+      if (kept === undefined) {
+        throw new Error(
+          `pull: the reply can't fit its caps (${limits.maxRows} rows, ${limits.maxBytes} bytes), even with one row of history`
+        );
+      }
+
+      const most = Math.min(limits.firstRows, built.fetched);
+
+      return {
+        built,
+        size: largest(least, most, (at) => fits(built, at, kept)) ?? least,
+        receipts: kept,
+      };
+    };
+
+    // Measured from each row's own encoding, then built once. A reply whose encoding isn't its rows' (a `respond`
+    // that reshapes rows) is chosen again by building each candidate whole.
+    const measured = choose((built, size, taken) => built.measure(size, taken).fits);
+    const made = measured.built.make(measured.size, measured.receipts);
+
+    if (made.made.bytes === measured.built.measure(measured.size, measured.receipts).bytes) {
+      return made.made;
     }
 
-    const most = Math.min(limits.firstRows, page.length);
+    const exact = choose((built, size, taken) => built.make(size, taken).fits);
 
-    return build(largest(least, most, (at) => build(at, count).fits) ?? least, count).made;
+    return exact.built.make(exact.size, exact.receipts).made;
   }
 
   /** The reply to one request, its encoded size, and what it carries before `respond` shaped it. */
