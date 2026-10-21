@@ -22,9 +22,10 @@ or the kit's own tests in `test/`.
   upgrades. A cached copy is read only under the row shapes that wrote it (`Schema.shape`, kept with the checkpoint).
   A partial copy's history is kept with its rows, under row shapes marked partial so a release from before paging
   never reads it; a delta takes a page's history only at the cursor that page moved from.
-- Nothing is sent before it is kept; observed and saved revisions are separate; a pull is owed while the server is
-  ahead, whatever the socket says; the push channel only pokes (`sync`). A push carries the revision each command was
-  tapped against, so a server can refuse intents made on a history it no longer has.
+- Nothing is sent before it is kept, and no push before it is kept as in flight; observed and saved revisions are
+  separate; a pull is owed while the server is ahead, whatever the socket says; the push channel only pokes (`sync`).
+  A push carries the revision each command was tapped against, so a server can refuse intents made on a history it no
+  longer has. Successive pulls name every command still waiting, a push's worth at a time.
 - A copy never claims more history than it holds (`sync`): complete, or partial with every row at or above its cursor
   and `through`. A delta applies only when `since ≤ copy.revision ≤ reply.revision` on the same dataset; only a reset
   replaces the copy; the cursor moves only on a reply to the copy's own `next`; a partial copy owes its next page, with

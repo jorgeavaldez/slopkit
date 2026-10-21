@@ -571,6 +571,37 @@ export function indexedReplica<T, P, S, C, O>(options: {
       }
     },
 
+    async mark(keys) {
+      const database = await db();
+      const transaction = database.transaction(["meta", "outbox"], "readwrite");
+      const done = committed(transaction);
+      const outbox = transaction.objectStore("outbox");
+
+      try {
+        await guard(transaction);
+
+        const kept = await Promise.all(
+          keys.map((key) => request<unknown>(outbox.get([key.client, key.id])))
+        );
+
+        // A push's commands, in flight, in one write: only records kept already, so nothing is admitted here.
+        for (const [at, record] of kept.entries()) {
+          const key = keys[at];
+
+          if (key !== undefined && typeof record === "object" && record !== null) {
+            outbox.put({ ...record, state: { kind: "sending" } }, [key.client, key.id]);
+          }
+        }
+
+        // An outbox write, as a keep is.
+        options.interfere?.("keep", transaction);
+        await done;
+      } catch (error) {
+        await done.catch(() => undefined);
+        throw error;
+      }
+    },
+
     /** Drop this device's copy and its outbox, and move to a new generation so no open tab writes it back. */
     async forget() {
       const database = await db();

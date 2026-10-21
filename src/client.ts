@@ -45,6 +45,11 @@ export type StoragePort<T, S, C, O> = {
   // oxlint-disable-next-line typescript/no-invalid-void-type -- an adapter that always admits answers like any write
   keep: (pending: Pending<C, O>, max?: number) => Promise<void | OutboxFull>;
   drop: (keys: { client: string; id: number }[]) => Promise<void>;
+  /**
+   * Journal a push before it is sent: these kept commands move to `sending`, all in one write (a key not kept is left
+   * alone). A command loaded so is uncertain, since that attempt may have acted.
+   */
+  mark: (keys: { client: string; id: number }[]) => Promise<void>;
 };
 
 export type NetworkPort<P, S, C, O> = {
@@ -158,7 +163,7 @@ export function createClient<T, P, S, C, O>(options: {
         const ids = effect.commands.map((each) => each.id);
         const client = effect.client;
 
-        return track(
+        const send = () =>
           ports.network
             .push({
               client,
@@ -178,7 +183,18 @@ export function createClient<T, P, S, C, O>(options: {
                 failure: { kind: "offline", message: reason(error) },
                 now: now(),
               })
-            ),
+            );
+
+        // Journalled before it is sent: a page that dies mid-push leaves these commands uncertain on disk.
+        return track(
+          ports.storage.mark(ids.map((id) => ({ client, id }))).then(send, (error: unknown): M => ({
+            type: "unsent",
+            client,
+            ids,
+            reason: reason(error),
+            replaced: error instanceof Replaced,
+            now: now(),
+          })),
           dispatch
         );
       }

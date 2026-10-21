@@ -27,6 +27,8 @@
  * - **A command id is never reused.** Each page load is a new client with its own numbers; commands loaded from an
  *   earlier page keep theirs.
  * - **Nothing is sent before it is kept.** An intent the device can't keep fails at once, visibly, and is never sent.
+ *   A push is journalled before it goes: its commands are kept as `sending` (one write per push), so a page that dies
+ *   mid-push leaves them uncertain on disk, and none goes unless that write lands.
  * - **Every command reaches an outcome, and is settled only once the replica holds its effects** (a receipt names the
  *   revision that made it visible; on a partial copy, only a pull reply that carried the receipt, with the rows it
  *   names, settles it); until then a pull is owed, and names the commands it waits on, any page's.
@@ -415,6 +417,8 @@ export type Model<T, S, C, O> = {
    * other tabs, whose commands this page doesn't hold); cleared once one is admitted or this page drops some.
    */
   outbox: { max: number; full: OutboxFull | null };
+  /** Where the next pull's list of waiting commands starts, when more wait than one pull names. */
+  asking: number;
   /** Commands (`client:id`) whose receipt came in a pull reply this copy applied, so with the rows it names. */
   carried: ReadonlySet<string>;
   /** Commands an earlier page kept that this version can't read: left on disk, and said. */
@@ -451,6 +455,15 @@ export type Msg<T, P, S, C, O> =
       now: number;
     }
   | { type: "pushFailed"; client: string; ids: number[]; failure: Failure; now: number }
+  /** A push's in-flight mark couldn't be kept, so it was never sent. */
+  | {
+      type: "unsent";
+      client: string;
+      ids: number[];
+      reason: string;
+      replaced: boolean;
+      now: number;
+    }
   /**
    * The disk holds the replica at `revision` (perhaps newer than asked, from another tab); `whole: false` when it took
    * the patch as a delta under its own, other history.
@@ -850,6 +863,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       push: { kind: "idle", nextAt: now, failures: 0 },
       commands: [],
       outbox: { max: outboxMax, full: null },
+      asking: 0,
       carried: new Set(),
       unreadable: 0,
       visible: true,
@@ -999,17 +1013,20 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       if ((owed && (failures === 0 || due)) || (polling && due)) {
         const current = next;
 
-        // Commands waiting on an outcome or on their effects, oldest first, at most a push's worth: their receipts
-        // come back with the rows they name; the rest in the next pull.
-        const commands = current.commands
+        // Commands waiting on an outcome or on their effects, at most a push's worth: their receipts come back with
+        // the rows they name. When more wait, each pull names the next ones round, so every one is asked about in
+        // turn (a parked command has no other way to settle).
+        const waiting = current.commands
           .filter(
             (each) =>
               each.state.kind === "sending" ||
               each.state.kind === "unknown" ||
               (each.state.kind === "done" && !settled(current, each))
           )
-          .slice(0, pushMax)
           .map((each) => ({ client: each.client, id: each.id }));
+
+        const turn = waiting.length > pushMax ? current.asking % waiting.length : 0;
+        const commands = [...waiting.slice(turn), ...waiting.slice(0, turn)].slice(0, pushMax);
 
         out.push({
           kind: "pull",
@@ -1022,6 +1039,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
         });
         next = {
           ...next,
+          asking: waiting.length > pushMax ? turn + pushMax : 0,
           pull: { kind: "pulling", since, failures },
           verify:
             verifying && next.verify.kind === "pending"
@@ -1183,22 +1201,6 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
     return (each: Pending<C, O>): CommandState<O> =>
       pushing?.was[pushing.ids.indexOf(each.id)] ?? { kind: "unknown", failure: "sent before" };
-  }
-
-  /** A command an attempt of which may have acted: unknown, kept so (once) so a reload still knows it may have. */
-  function uncertain(
-    pending: Pending<C, O>,
-    was: CommandState<O>,
-    failure: string,
-    effects: E[]
-  ): Pending<C, O> {
-    const next: Pending<C, O> = { ...pending, state: { kind: "unknown", failure } };
-
-    if (was.kind !== "unknown") {
-      effects.push(keep(next));
-    }
-
-    return next;
   }
 
   function reduce(model: M, msg: Msg<T, P, S, C, O>): Step {
@@ -1423,16 +1425,14 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
       case "pushed": {
         const ids = new Set(msg.ids);
         const [answered, effects] = answer(at, msg.client, msg.receipts, ids);
-        const before = prior(at, msg.client);
 
-        // A command the reply has no receipt for is still acting elsewhere: asked again, and kept as uncertain.
-        const commands = answered.commands.map((each): Pending<C, O> => {
-          if (each.client !== msg.client || !ids.has(each.id) || each.state.kind !== "sending") {
-            return each;
-          }
-
-          return uncertain(each, before(each), "the server is still on it", effects);
-        });
+        // A command the reply has no receipt for is still acting elsewhere: asked again. The disk holds its in-flight
+        // mark, so a reload knows it too.
+        const commands = answered.commands.map((each): Pending<C, O> =>
+          each.client === msg.client && ids.has(each.id) && each.state.kind === "sending"
+            ? { ...each, state: { kind: "unknown", failure: "the server is still on it" } }
+            : each
+        );
 
         const waiting = commands.some(
           (each) => each.client === msg.client && ids.has(each.id) && each.state.kind !== "done"
@@ -1482,16 +1482,29 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
               : { ...each, state: was };
           }
 
-          // An envelope refusal (a page and server of different releases) or a kit forbidden or conflict: nothing in
-          // this attempt acted. Final only for a command no attempt of which may have acted.
-          if (refused) {
-            return failure.kind === "invalid" || doubt
+          // A kit forbidden or conflict: nothing in this attempt acted. Final only for a command no attempt of which
+          // may have acted.
+          if (refused && failure.kind !== "invalid") {
+            return doubt
               ? { ...each, state: was }
               : refuse(each, false, failure.message, now, effects);
           }
 
+          // An envelope refusal (a page and server of different releases): nothing acted, and the page stops. The disk
+          // holds the in-flight mark: a command never uncertain is kept as it was again.
+          if (refused) {
+            const restored: Pending<C, O> = { ...each, state: was };
+
+            if (!doubt) {
+              effects.push(keep(restored));
+            }
+
+            return restored;
+          }
+
           // Anything else may have acted (a lost reply, an unreadable one, a proxy's answer): asked again, same key.
-          return uncertain(each, was, failure.message, effects);
+          // The disk holds its in-flight mark.
+          return { ...each, state: { kind: "unknown", failure: failure.message } };
         });
 
         const telemetry: E = {
@@ -1528,6 +1541,27 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
             },
           },
           [...effects, telemetry],
+        ];
+      }
+
+      case "unsent": {
+        // Never sent: each command is what it was before, and goes again once the disk keeps its mark.
+        const ids = new Set(msg.ids);
+        const before = prior(at, msg.client);
+        const failures = (at.push.kind === "pushing" ? at.push.failures : 0) + 1;
+
+        return [
+          {
+            ...at,
+            commands: at.commands.map((each): Pending<C, O> =>
+              each.client === msg.client && ids.has(each.id) && each.state.kind === "sending"
+                ? { ...each, state: before(each) }
+                : each
+            ),
+            storage: msg.replaced ? { kind: "replaced" } : { kind: "failed", reason: msg.reason },
+            push: { kind: "idle", nextAt: now + backoff(failures), failures },
+          },
+          [{ kind: "telemetry", name: "push.unsent", attributes: { reason: msg.reason } }],
         ];
       }
 
