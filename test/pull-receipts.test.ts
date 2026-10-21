@@ -211,3 +211,52 @@ test("a minimum reply over the caps is refused, not sent", () => {
     /can't fit/
   );
 });
+
+// A partial copy two pages in, then another device imports 11 rows: 11 + a full 20-row page is over 30, but 11 alone
+// fits, so the older page shrinks to the 19 rows left and the 25 rows already held stay.
+test("a delta that fits beside a smaller page shrinks the page instead of resetting", () => {
+  const store = app({ firstRows: 5, pageRows: 20, maxRows: 30, maxBytes: 1_000_000 });
+  store.transaction(() => store.put(Array.from({ length: 100 }, (_, at) => [`n${at}`, at])));
+  const first = store.pull.pull({ dataset: null, since: 0, page: null }, "dev").pulled;
+
+  const second = store.pull.pull(
+    { dataset: first.dataset, since: first.revision, page: first.page?.next ?? null },
+    "dev"
+  ).pulled;
+
+  store.transaction(() => store.put(Array.from({ length: 11 }, (_, at) => [`m${at}`, 1000 + at])));
+
+  const third = store.pull.pull(
+    { dataset: second.dataset, since: second.revision, page: second.page?.next ?? null },
+    "dev"
+  ).pulled;
+
+  expect(third.reset).toBe(false);
+  expect(third.page?.from).toBe(second.page?.next);
+  expect(third.rows).toHaveLength(30);
+  // The older page goes on newest first from where the second one stopped: n74 down to n56.
+  expect(third.rows.filter((row) => row.id.startsWith("n")).map((row) => row.id)).toStrictEqual(
+    Array.from({ length: 19 }, (_, at) => `n${74 - at}`)
+  );
+  expect(third.page?.held).toBe(11 + 25 + 19);
+});
+
+// The delta alone fills the cap: it comes as it is, the cursor stays where it was, and the copy is never called
+// complete for it.
+test("a delta that fills the row cap leaves the cursor in place and never claims completion", () => {
+  const store = app({ firstRows: 2, pageRows: 3, maxRows: 10, maxBytes: 1_000_000 });
+  store.transaction(() => store.put(Array.from({ length: 20 }, (_, at) => [`n${at}`, at])));
+  const first = store.pull.pull({ dataset: null, since: 0, page: null }, "dev").pulled;
+  store.transaction(() => store.put(Array.from({ length: 10 }, (_, at) => [`m${at}`, 1000 + at])));
+
+  const reply = store.pull.pull(
+    { dataset: first.dataset, since: first.revision, page: first.page?.next ?? null },
+    "dev"
+  ).pulled;
+
+  expect(reply.reset).toBe(false);
+  expect(reply.rows).toHaveLength(10);
+  expect(reply.page?.from).toBe(first.page?.next);
+  expect(reply.page?.next).toBe(first.page?.next);
+  expect(reply.page?.held).toBe(12);
+});

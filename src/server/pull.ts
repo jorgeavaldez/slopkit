@@ -14,9 +14,9 @@
  *   the lowest order group held whole: a page ending inside a tie leaves that group out until it lands whole, and it
  *   is null while no group is whole.
  * - **Every paging-aware reply is bounded** by `limits`: the history's rows, the other tables' and the receipts' rows
- *   together within `maxRows`, the reply as `respond` builds it within `maxBytes` encoded. A delta that doesn't fit in
- *   rows with a full page beside it, or doesn't fit in bytes, is answered as a paged reset; an older page shrinks to
- *   fit its bytes. A reset carries one row of history at least, then as many receipts as fit, then more rows; one
+ *   together within `maxRows`, the reply as `respond` builds it within `maxBytes` encoded. A delta (with its receipts'
+ *   rows and the other tables) that can't fit by itself is answered as a paged reset; otherwise the older page shrinks
+ *   to the rows and bytes it leaves, and with no room at all the cursor stays where it was. A reset carries one row of history at least, then as many receipts as fit, then more rows; one
  *   that can't fit even so (the other tables alone are over the caps) is never sent: `pull` throws, a server fault
  *   the page sees as unavailable and retries.
  * - **Receipts carry their rows.** A row a receipt names is in the reply that carries the receipt, even below the page,
@@ -33,7 +33,7 @@
  * by opening one around `pull`, and keep its few bytes in mind under `maxBytes`, which measures `respond`'s reply.
  */
 import { Buffer } from "node:buffer";
-import type { DatabaseSync, SQLInputValue, SQLOutputValue } from "node:sqlite";
+import type { DatabaseSync, SQLOutputValue } from "node:sqlite";
 
 import type { Page } from "../sync.ts";
 
@@ -197,7 +197,7 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
     JSON.stringify([dataset, paged.version, ...values(row, order)]);
 
   /** A cursor's order values, or undefined for one this history can't honour. */
-  function decode(text: string, dataset: string): SQLInputValue[] | undefined {
+  function decode(text: string, dataset: string): (string | number)[] | undefined {
     let parsed: unknown;
 
     try {
@@ -289,7 +289,7 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
      * them now. Says whether it fits the caps, and how many rows it carries.
      */
     const reply = (
-      fixed: { reset: boolean; from: string | null; unpaged: U },
+      fixed: { reset: boolean; from: string | null; unpaged: U; at?: Row },
       page: Row[],
       kept: readonly Rc[],
       extra: Row[]
@@ -310,7 +310,7 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
           ...fixed,
           rows: [...rows.values()].map(paged.read),
           receipts: kept.slice(0, count),
-          page: place(dataset, fixed.from, page[size - 1], page.length > size),
+          page: place(dataset, fixed.from, page[size - 1] ?? fixed.at, page.length > size),
         });
 
         const carried = rows.size + sizeOf(fixed.unpaged);
@@ -323,25 +323,30 @@ export function createPull<R, U extends Record<string, readonly unknown[]>, Rc, 
       const unpaged = options.unpaged(since);
       const room = cursor === null ? 0 : limits.pageRows;
       const page = cursor === null ? [] : sql.older.all(...cursor, room + 1);
-      const from = request.page;
+
+      // The cursor as the row it stands for: a reply with no older row leaves the copy there.
+      const at =
+        cursor === null
+          ? {}
+          : {
+              at: Object.fromEntries(order.map((column, index) => [column, cursor[index] ?? null])),
+            };
 
       const build = reply(
-        { reset: false, from, unpaged },
+        { reset: false, from: request.page, unpaged, ...at },
         page,
         receipts(since),
         sql.changes.all(since)
       );
 
-      const most = Math.min(room, page.length);
+      const alone = build(0);
 
-      // The changes and every receipt's rows fit beside a full page, or the copy starts over; the page then shrinks to
-      // fit the bytes, keeping one row at least.
-      if (build(0).carried + room <= limits.maxRows) {
-        const size = largest(Math.min(1, most), most, (at) => build(at).fits);
+      // Only a delta (with its receipts' rows and the other tables) that can't fit by itself starts the copy over; the
+      // older page takes the rows and bytes it leaves.
+      if (alone.fits) {
+        const most = Math.min(room, page.length, limits.maxRows - alone.carried);
 
-        if (size !== undefined) {
-          return build(size).made;
-        }
+        return build(largest(1, most, (size) => build(size).fits) ?? 0).made;
       }
     }
 
