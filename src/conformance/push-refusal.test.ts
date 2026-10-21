@@ -792,15 +792,22 @@ test.each([404, 405, 413])(
   }
 );
 
-test.each([
-  { body: "not JSON", type: "text/plain" },
-  { body: '{"text":', type: "application/json" },
-  { body: "<html>not a JSON reply</html>", type: "text/html" },
-])("a successful reply that breaks JSON is unreadable: $type", async ({ body, type }) => {
-  const options = await intermediary(200, body, type);
+test.each(["not JSON", '{"text":'])(
+  "a JSON-typed successful reply that breaks JSON is unreadable: %s",
+  async (body) => {
+    const options = await intermediary(200, body);
+    expect(await call(echo, { text: "x" }, options)).toMatchObject({
+      ok: false,
+      failure: { kind: "unreadable" },
+    });
+  }
+);
+
+test("a successful HTML login page is signed-out, not an unreadable origin reply", async () => {
+  const options = await intermediary(200, "<html>sign in</html>", "text/html");
   expect(await call(echo, { text: "x" }, options)).toMatchObject({
     ok: false,
-    failure: { kind: "unreadable" },
+    failure: { kind: "signed-out" },
   });
 });
 
