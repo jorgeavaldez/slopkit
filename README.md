@@ -94,6 +94,10 @@ export default defineConfig({
 });
 ```
 
+push handlers return per-command outcomes as ledger receipts. once any command in a request has acted, never throw
+an `invalid`, `forbidden` or `conflict` refusal for the whole request: a refusal proves only that attempt did not act,
+not that an earlier delivery did not. request schemas are checked before the handler runs.
+
 ### sync in pages
 
 a device with no copy draws its newest rows after one round trip, whatever the history's size, then pulls older pages

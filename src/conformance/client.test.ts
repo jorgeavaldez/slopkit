@@ -17,7 +17,7 @@ function peer() {
   const sent: { client: string; id: number; value: number; dataset: string }[] = [];
   const pulls: { client: string; since: number }[] = [];
   let loseNextPush = false;
-  let invalidNextPush = false;
+  let unreadableNextPush = false;
   let rejectPull = false;
   let unavailable = false;
 
@@ -79,12 +79,12 @@ function peer() {
         return { ok: false, failure: { kind: "offline", message: "reply lost after execution" } };
       }
 
-      if (invalidNextPush) {
-        invalidNextPush = false;
+      if (unreadableNextPush) {
+        unreadableNextPush = false;
 
         return {
           ok: false,
-          failure: { kind: "invalid", message: "unreadable reply after execution" },
+          failure: { kind: "unreadable", message: "unreadable reply after execution" },
         };
       }
 
@@ -100,8 +100,8 @@ function peer() {
     loseReply: () => {
       loseNextPush = true;
     },
-    invalidReply: () => {
-      invalidNextPush = true;
+    unreadableReply: () => {
+      unreadableNextPush = true;
     },
     failPull: () => {
       rejectPull = true;
@@ -369,7 +369,7 @@ describe("independent client executor conformance", () => {
     const remote = peer();
     const app = client(stored, remote.network, "page-a", { now: 0 });
     await start(app, stored);
-    remote.invalidReply();
+    remote.unreadableReply();
     app.runtime.command({ name: "put", value: 125 });
     await app.runtime.settle();
     expect(remote.effects()).toBe(1);
