@@ -117,19 +117,23 @@ function kindOf(status: number): Failure["kind"] {
   return "invalid";
 }
 
-/** `Retry-After` as milliseconds from now: delay seconds or an HTTP date; undefined when absent or unreadable. */
+/** The longest a `Retry-After` defers the next try: a bad header can delay sync, never stop it. */
+export const RETRY_AFTER_MAX_MS = 3_600_000;
+
+/**
+ * `Retry-After` as milliseconds from now, capped at `RETRY_AFTER_MAX_MS`: delay seconds or an HTTP date; undefined
+ * when absent or unreadable.
+ */
 function retryAfter(value: string | null): number | undefined {
   if (value === null) {
     return undefined;
   }
 
-  if (/^\d+$/.test(value.trim())) {
-    return Number(value.trim()) * 1000;
-  }
+  const at = /^\d+$/.test(value.trim())
+    ? Number(value.trim()) * 1000
+    : Date.parse(value) - Date.now();
 
-  const at = Date.parse(value);
-
-  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
+  return Number.isNaN(at) ? undefined : Math.min(RETRY_AFTER_MAX_MS, Math.max(0, at));
 }
 
 /** GET requests carry their input as one `q` query parameter of JSON; POST as the body. */
@@ -201,25 +205,28 @@ export async function call<Req, Res>(
     const named = kit.ok ? KINDS.find((each) => each === kit.value.kind) : undefined;
 
     // Only the kit's own body, naming a kind its status carries, is the server's refusal; anything else is a status.
-    if (kit.ok && named !== undefined && STATUS[named] === response.status) {
+    const own = kit.ok && named !== undefined && STATUS[named] === response.status;
+    const kind = own ? named : kindOf(response.status);
+
+    const after =
+      kind === "unavailable" ? retryAfter(response.headers.get("retry-after")) : undefined;
+
+    if (own) {
       const path = kit.value.path;
 
       return {
         ok: false,
         failure: {
-          kind: named,
+          kind,
           message: kit.value.message,
           refused: true,
           ...(path === undefined ? {} : { path }),
+          ...(after === undefined ? {} : { retryAfterMs: after }),
         },
       };
     }
 
     const error = check(ERROR_BODY, body);
-    const kind = kindOf(response.status);
-
-    const after =
-      kind === "unavailable" ? retryAfter(response.headers.get("retry-after")) : undefined;
 
     return {
       ok: false,
