@@ -316,6 +316,18 @@ and badge, not which facts survive. A headline claim stays in `claims` and isn't
    out. A real file I/O failure rejects the call and leaves the file intact; after repair, earlier sessions are
    readable again.
 
+### Agent access (`agent-access.test.ts`, `slopkit/test/agents`)
+
+Each app runs `agentAccess` against its real server, listing what its agents read and what only the person may do;
+this case proves the check itself.
+
+1. A key reads each listed read with no Origin and no login; the same read is signed-out without credentials and
+   forbidden with an unknown key.
+2. A key is refused each listed person's call: `forbidden`, or an answer the case judges a refusal (a sync push's
+   forbidden receipts).
+3. A person's route a key can call, or an agent's read a key can't, fails the check naming the call; a check listing
+   no read or no refused call fails.
+
 ## Limits
 
 These checks run headless. They make no claim about an app's DOM and bindings, real provider recovery, HTTP

@@ -110,6 +110,10 @@
       "types": "./dist/server/secrets.d.ts",
       "default": "./dist/server/secrets.js"
     },
+    "./test/agents": {
+      "types": "./dist/test/agents.d.ts",
+      "default": "./dist/test/agents.js"
+    },
     "./test/network": {
       "types": "./dist/test/network.d.ts",
       "default": "./dist/test/network.js"

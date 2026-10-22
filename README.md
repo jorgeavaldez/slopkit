@@ -94,6 +94,20 @@ export default defineConfig({
 });
 ```
 
+agents call your app with a key (`addKey(home, name)` from `slopkit/server/keys`, allowed as `key:<name>` in
+`web.allow`), never as the person. prove it in your own tests against your real server:
+
+```ts
+import { agentAccess, reads, refused } from "slopkit/test/agents";
+
+await agentAccess({
+  url: server.url,
+  token: await addKey(home, "agent"),
+  reads: [reads(list, {})],
+  refused: [refused(push, request, { refusal: (reply) => reply.results.every(forbidden) })],
+});
+```
+
 push handlers return per-command outcomes as ledger receipts. once any command in a request has acted, never throw
 an `invalid`, `forbidden` or `conflict` refusal for the whole request: a refusal proves only that attempt did not act,
 not that an earlier delivery did not. request schemas are checked before the handler runs.
