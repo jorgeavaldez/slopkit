@@ -29,8 +29,16 @@ export class Replaced extends Error {
 }
 
 export type StoragePort<T, S, C, O> = {
-  /** The replica and the outbox; `unreadable` counts kept commands this version can't read (left on disk). */
-  load: () => Promise<{ replica: Replica<T, S>; commands: Pending<C, O>[]; unreadable: number }>;
+  /**
+   * The replica and the outbox; `unreadable` counts kept commands this version can't read (left on disk); `restart`
+   * when the copy owes a real reset before it is trusted (one lifted from an earlier release's row shapes).
+   */
+  load: () => Promise<{
+    replica: Replica<T, S>;
+    commands: Pending<C, O>[];
+    unreadable: number;
+    restart?: "paged";
+  }>;
   /**
    * Commit a patch, decided against the disk inside its transaction; returns what the disk now holds, and `whole:
    * false` when it took the patch as a delta under its own history (so it lacks rows of this page's copy).

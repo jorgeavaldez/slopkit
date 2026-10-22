@@ -221,20 +221,26 @@ function found(value: unknown): Found {
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
-// oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
 type AnyModel = Model<any, any, any, any>;
 
 /** A pull in flight, or one the engine would start now: the page visible, the connection letting it, a pull owed. */
 function pullUnderWay(model: AnyModel, now: number): boolean {
+  if (model.pull.kind === "pulling") {
+    return true;
+  }
+
   const connection = model.connection.kind;
   const canPull = model.visible && connection !== "signed-out" && connection !== "incompatible";
 
-  const owesPull =
+  const owed =
+    model.restart !== null ||
     model.target > model.replica.revision ||
-    deriveHistoryState(model).kind === "partial" ||
-    (model.pull.kind === "idle" && model.pull.nextAt <= now);
+    deriveHistoryState(model).kind === "partial";
 
-  return model.pull.kind === "pulling" || (canPull && owesPull);
+  // As the engine starts one: an owed pull right away unless it is in backoff, any pull once its retry is due.
+  const due = model.pull.nextAt <= now;
+
+  return canPull && (due || (owed && model.pull.failures === 0));
 }
 
 /** A push in flight, or one the engine would start now: the connection live or stale and no backoff pending. */

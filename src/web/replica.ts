@@ -22,9 +22,10 @@
  * - An upgrade keeps the outbox and the generation (an intent on disk is never erased; one this version can't read
  *   stays on disk and is counted) and the copy where it can: a table whose row shape is unchanged is kept as it is, one
  *   whose shape changed goes through the app's lift (`lifts`), a table that is new starts empty. The copy is rewritten
- *   under this release's shapes in one transaction, kept only if every table then reads, and claims no history
- *   (revision 0, no server facts), so the first contact replaces it whole; offline it shows what it had. A changed
- *   table with no lift, or a row that still doesn't read, starts the copy over.
+ *   under this release's shapes in one transaction, kept only if every table then reads, keeps its dataset and
+ *   revision (taps made on it carry it) but no server facts, and is marked lifted: it loads owing a real reset, so the
+ *   first contact replaces it whole; offline it shows what it had. A changed table with no lift, a row that still
+ *   doesn't read, or a table this release doesn't have starts the copy over.
  * - A newer version opening in another tab closes this page's connection; its writes then fail as `Replaced`.
  *
  * `factory` is the browser's `indexedDB`, or any implementation of the same API (the headless simulation passes an
@@ -50,6 +51,8 @@ type Checkpoint<S> = Omit<Position, "history"> & {
    * copy's are marked, so a release that can't page doesn't read them.
    */
   shapes: string;
+  /** Lifted from an earlier release's row shapes: owes a real reset before it's trusted; gone with a whole write. */
+  lifted?: true;
 };
 
 const COMPLETE: History = { kind: "complete" };
@@ -63,6 +66,24 @@ const partialSchema = object({
   held: count(),
   total: count(),
 });
+
+/** The replica tables a checkpoint's row shapes name (each line `"<name>":<shape>`). */
+function tablesOf(point: unknown): Set<string> {
+  const written: unknown =
+    typeof point === "object" && point !== null ? Reflect.get(point, "shapes") : undefined;
+
+  const found = new Set<string>();
+
+  for (const line of typeof written === "string" ? written.split("\n") : []) {
+    const name = /^("(?:[^"\\]|\\.)*"):/.exec(line)?.[1];
+
+    if (name !== undefined) {
+      found.add(String(JSON.parse(name)));
+    }
+  }
+
+  return found;
+}
 
 export function indexedReplica<T, P, S, C, O>(options: {
   factory: IDBFactory;
@@ -81,7 +102,9 @@ export function indexedReplica<T, P, S, C, O>(options: {
   legacy?: { store: string; convert: (value: unknown) => Pending<C, O> | undefined };
   /**
    * By table: an earlier release's row, as this one reads it (a field it added, given). A table whose row shape
-   * changed needs one, or the copy starts over; a table whose shape didn't is kept as it is.
+   * changed needs one, or the copy starts over; a table whose shape didn't is kept as it is. A lift may be handed any
+   * other release's row, a newer one's too (a rollback): it parses the shapes it knows strictly and throws on others,
+   * which starts the copy over.
    */
   lifts?: Readonly<Record<string, (row: unknown) => unknown>>;
 }): StoragePort<T, S, C, O> & { forget: () => Promise<void> } {
@@ -117,9 +140,13 @@ export function indexedReplica<T, P, S, C, O>(options: {
       opening.onerror = () => reject(opening.error ?? new Error(`can't open ${options.name}`));
     });
 
-    const missing = [...names, "meta", "outbox"].some(
-      (name) => !probe.objectStoreNames.contains(name)
-    );
+    // A store missing, or one this release doesn't have (a table dropped without a bump): the upgrade runs while the
+    // checkpoint still names a dropped table, so its rows are deleted, never moved into the outbox.
+    const missing =
+      [...names, "meta", "outbox"].some((name) => !probe.objectStoreNames.contains(name)) ||
+      [...probe.objectStoreNames].some(
+        (name) => !names.includes(name) && name !== "meta" && name !== "outbox"
+      );
 
     const current = probe.version;
     probe.close();
@@ -135,9 +162,10 @@ export function indexedReplica<T, P, S, C, O>(options: {
     opened ??= layout()
       .then((version) =>
         openDatabase(options.factory, options.name, version, (database, _from, upgrade) => {
-          // Replica tables start over (the server has them); every other store an earlier version kept may hold work
-          // nobody else has, so its records move into the outbox: converted by `legacy`, else kept as they were under
-          // their own key, counted unreadable. Nothing is dropped unseen.
+          // Replica tables stay for the load to lift; one the copy held that this release dropped goes (the server has
+          // it). Every other store an earlier version kept may hold work nobody else has, so its records move into the
+          // outbox: converted by `legacy`, else kept as they were under their own key, counted unreadable. Nothing is
+          // dropped unseen.
           const legacy = options.legacy;
           const own = new Set(["meta", "outbox"]);
 
@@ -145,8 +173,9 @@ export function indexedReplica<T, P, S, C, O>(options: {
             database.createObjectStore("outbox");
           }
 
-          // Replica tables and the checkpoint are kept for the load to lift; a table that is new is made empty.
-          if (!database.objectStoreNames.contains("meta")) {
+          const kept = database.objectStoreNames.contains("meta");
+
+          if (!kept) {
             database.createObjectStore("meta");
           }
 
@@ -155,37 +184,47 @@ export function indexedReplica<T, P, S, C, O>(options: {
           // A snapshot: deleting a store changes the live list being walked.
           const existing = [...database.objectStoreNames];
 
-          for (const name of existing) {
-            if (own.has(name)) {
-              continue;
-            }
+          const walk = (replicated: ReadonlySet<string>) => {
+            for (const name of existing) {
+              if (own.has(name) || names.includes(name)) {
+                continue;
+              }
 
-            if (names.includes(name)) {
-              continue;
-            }
-
-            const cursor = upgrade.objectStore(name).openCursor();
-            let at = 0;
-            cursor.onsuccess = () => {
-              const current = cursor.result;
-
-              if (current === null) {
+              if (replicated.has(name)) {
                 database.deleteObjectStore(name);
-
-                return;
+                continue;
               }
 
-              const value: unknown = current.value;
-              const command = legacy?.store === name ? legacy.convert(value) : undefined;
+              const cursor = upgrade.objectStore(name).openCursor();
+              let at = 0;
+              cursor.onsuccess = () => {
+                const current = cursor.result;
 
-              if (command === undefined) {
-                outbox.put(value, ["legacy", name, at++]);
-              } else {
-                outbox.put(command, [command.client, command.id]);
-              }
+                if (current === null) {
+                  database.deleteObjectStore(name);
 
-              current.continue();
-            };
+                  return;
+                }
+
+                const value: unknown = current.value;
+                const command = legacy?.store === name ? legacy.convert(value) : undefined;
+
+                if (command === undefined) {
+                  outbox.put(value, ["legacy", name, at++]);
+                } else {
+                  outbox.put(command, [command.client, command.id]);
+                }
+
+                current.continue();
+              };
+            }
+          };
+
+          if (kept) {
+            const point = upgrade.objectStore("meta").get("checkpoint");
+            point.onsuccess = () => walk(tablesOf(point.result));
+          } else {
+            walk(new Set());
           }
 
           for (const name of names) {
@@ -315,10 +354,10 @@ export function indexedReplica<T, P, S, C, O>(options: {
 
   /**
    * Write a lifted copy in place of the one it came from, in one transaction, if the disk still holds that one: its
-   * dataset, at revision 0, under this release's shapes. False when the disk moved on (another tab wrote) or refused.
+   * dataset and revision, marked lifted, under this release's shapes. False when the disk moved on or refused.
    */
   const rewrite = async (
-    from: { dataset: string; revision: unknown; shapes: string },
+    from: { dataset: string; revision: number; shapes: string },
     tables: T,
     history: History
   ): Promise<boolean> => {
@@ -359,8 +398,9 @@ export function indexedReplica<T, P, S, C, O>(options: {
 
       const checkpoint: Checkpoint<S> = {
         dataset: from.dataset,
-        revision: 0,
+        revision: from.revision,
         server: null,
+        lifted: true,
         ...(history.kind === "partial" ? { history, shapes: partialShapes } : { shapes }),
       };
 
@@ -376,7 +416,10 @@ export function indexedReplica<T, P, S, C, O>(options: {
     }
   };
 
-  return {
+  /** A load that lost a lift to another tab reads again once: that tab's rewrite is readable now. */
+  let again = false;
+
+  const port: StoragePort<T, S, C, O> & { forget: () => Promise<void> } = {
     async load() {
       const database = await db();
       const transaction = database.transaction([...names, "meta", "outbox"], "readonly");
@@ -442,22 +485,36 @@ export function indexedReplica<T, P, S, C, O>(options: {
         const partial = check(partialSchema, Reflect.get(point ?? {}, "history"));
         const history: History = up?.partial === true && partial.ok ? partial.value : COMPLETE;
 
-        if (
+        const revision = typeof disk === "number" ? disk : 0;
+
+        const wrote =
           up !== undefined &&
           (!up.partial || partial.ok) &&
-          (await rewrite({ dataset: held, revision: disk, shapes: written }, up.tables, history))
-        ) {
+          (await rewrite({ dataset: held, revision, shapes: written }, up.tables, history));
+
+        if (up !== undefined && !wrote && !again) {
+          again = true;
+
+          try {
+            return await port.load();
+          } finally {
+            again = false;
+          }
+        }
+
+        if (up !== undefined && wrote) {
           loaded = {
             dataset: held,
-            revision: 0,
+            revision,
             shapes: history.kind === "partial" ? partialShapes : shapes,
           };
           discarded = null;
 
           return {
-            replica: { dataset: held, revision: 0, tables: up.tables, server: null, history },
+            replica: { dataset: held, revision, tables: up.tables, server: null, history },
             commands,
             unreadable,
+            restart: "paged",
           };
         }
       }
@@ -500,6 +557,9 @@ export function indexedReplica<T, P, S, C, O>(options: {
         return { replica: empty, commands, unreadable };
       }
 
+      const lifted =
+        typeof point === "object" && point !== null && Reflect.get(point, "lifted") === true;
+
       return {
         replica: {
           dataset: at.dataset,
@@ -510,6 +570,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
         },
         commands,
         unreadable,
+        ...(lifted ? { restart: "paged" as const } : {}),
       };
     },
 
@@ -546,13 +607,25 @@ export function indexedReplica<T, P, S, C, O>(options: {
 
         const stored = checkpointOf(point);
 
-        const plan = commitPlan(stored, {
-          ...target,
-          reset: commit.reset,
-          base: commit.base,
-          replaces: commit.replaces,
-          ...(commit.from === undefined ? {} : { from: commit.from }),
-        });
+        const liftedOnDisk =
+          typeof point === "object" && point !== null && Reflect.get(point, "lifted") === true;
+
+        // The reset a lifted copy owes (a pull since 0, at or past its revision) replaces it whole even when the
+        // server hasn't moved: the disk claims the revision, not the rows. A repair write (base at the revision) can't.
+        const plan =
+          liftedOnDisk &&
+          commit.reset &&
+          commit.base === 0 &&
+          held === commit.replica.dataset &&
+          commit.replica.revision >= stored.revision
+            ? "whole"
+            : commitPlan(stored, {
+                ...target,
+                reset: commit.reset,
+                base: commit.base,
+                replaces: commit.replaces,
+                ...(commit.from === undefined ? {} : { from: commit.from }),
+              });
 
         // The disk holds a dataset this page never saw: the server replaced the one this page is on.
         if (plan === "stale") {
@@ -625,8 +698,13 @@ export function indexedReplica<T, P, S, C, O>(options: {
             ? (commit.replica.history ?? COMPLETE)
             : stored.history;
 
+        // A lifted copy stays marked until a whole write replaces it: a delta or new facts don't make it trusted.
+        const lifted = plan !== "whole" && liftedOnDisk;
+
+        // A lifted copy keeps no server facts either until the reset: they'd vouch for rows the server never sent.
         const checkpoint: Checkpoint<S> = {
           ...target,
+          ...(lifted ? { server: null, lifted: true as const } : {}),
           ...(history.kind === "partial" ? { history, shapes: partialShapes } : { shapes }),
         };
 
@@ -770,4 +848,6 @@ export function indexedReplica<T, P, S, C, O>(options: {
       await done;
     },
   };
+
+  return port;
 }

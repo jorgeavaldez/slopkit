@@ -441,6 +441,8 @@ export type Msg<T, P, S, C, O> =
       replica: Replica<T, S>;
       commands: Pending<C, O>[];
       unreadable: number;
+      /** The copy owes a real reset before it is trusted (lifted from an earlier release's row shapes). */
+      restart?: "paged";
       now: number;
     }
   | { type: "loadFailed"; reason: string; now: number }
@@ -1248,6 +1250,7 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
             replica: msg.replica,
             saved: { ...at.saved, dataset: msg.replica.dataset, revision: msg.replica.revision },
             target: Math.max(at.target, msg.replica.revision),
+            restart: msg.restart ?? at.restart,
             commands: [...resumed, ...at.commands],
             unreadable: msg.unreadable,
           },
