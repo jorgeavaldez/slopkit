@@ -64,6 +64,10 @@ let selection = "a";
 let probe = "not asked";
 let loop = false;
 let interval: ReturnType<typeof setInterval> | undefined;
+let address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+let popstates = 0;
+let localDraft = window.localStorage.getItem("local-draft") ?? "";
+let sessionDraft = window.sessionStorage.getItem("session-draft") ?? "";
 const root = document.querySelector("#app");
 
 if (!root) {
@@ -77,11 +81,58 @@ function send(id: string, value: number) {
 }
 
 function paint() {
+  function navigate(path: string) {
+    window.history.pushState({}, "", path);
+    address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    paint();
+  }
+
   render(
     h(
       "main",
       {},
       h("button", { "aria-label": "send x", onClick: () => send("x", 9) }, "×"),
+      h("button", { onClick: () => navigate("/items?item=b#details") }, "open item b"),
+      h("button", { onClick: () => navigate("/items?item=c#details") }, "open item c"),
+      h("input", {
+        "aria-label": "local draft",
+        value: localDraft,
+        onInput: (event: Event) => {
+          const target = event.currentTarget;
+
+          if (!(target instanceof HTMLInputElement)) {
+            throw new Error("not an input");
+          }
+
+          localDraft = target.value;
+          window.localStorage.setItem("local-draft", localDraft);
+          paint();
+        },
+      }),
+      h("input", {
+        "aria-label": "session draft",
+        value: sessionDraft,
+        onInput: (event: Event) => {
+          const target = event.currentTarget;
+
+          if (!(target instanceof HTMLInputElement)) {
+            throw new Error("not an input");
+          }
+
+          sessionDraft = target.value;
+          window.sessionStorage.setItem("session-draft", sessionDraft);
+          paint();
+        },
+      }),
+      h("output", { "aria-label": "page address" }, address),
+      h(
+        "output",
+        { "aria-label": "open item" },
+        new URL(address, window.location.origin).searchParams.get("item") ?? "none"
+      ),
+      h("output", { "aria-label": "popstate count" }, String(popstates)),
+      h("output", { "aria-label": "saved local draft" }, localDraft),
+      h("output", { "aria-label": "saved session draft" }, sessionDraft),
       h("button", { onClick: () => send("long", 2) }, "send x twice"),
       h(
         "a",
@@ -263,6 +314,12 @@ function paint() {
 runtime.subscribe(paint);
 
 window.addEventListener("pagehide", () => runtime.stop());
+
+window.addEventListener("popstate", () => {
+  popstates++;
+  address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  paint();
+});
 
 runtime.start();
 

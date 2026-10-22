@@ -23,7 +23,7 @@ afterEach(async () => {
   page = undefined;
 });
 
-async function open(idle?: number) {
+async function open(idle?: number, path?: string) {
   page = await openPage({
     server: async (options: ServerInput) => {
       server = await startServer(options);
@@ -39,6 +39,7 @@ async function open(idle?: number) {
     order: MEANINGS,
     viewport: { width: 412, height: 915 },
     ...(idle === undefined ? {} : { idle }),
+    ...(path === undefined ? {} : { path }),
   });
 
   return page;
@@ -303,4 +304,93 @@ test("one page at a time; close releases the slot and stops its server", async (
   await expect(fetch(oldUrl)).rejects.toThrow(Error);
   const second = await open();
   expect(second.text("transactions")).toContain("seed:42");
+});
+
+function location(p: Awaited<ReturnType<typeof openPage>>): string {
+  const current: typeof p & { location?: () => string } = p;
+
+  if (!current.location) {
+    throw new Error("page.location is not available");
+  }
+
+  return current.location();
+}
+
+async function back(p: Awaited<ReturnType<typeof openPage>>) {
+  const current: typeof p & { back?: () => void | Promise<void> } = p;
+
+  if (!current.back) {
+    throw new Error("page.back is not available");
+  }
+
+  await current.back();
+  await p.settle();
+}
+
+test("a deep link loads its path, query and fragment before the page reads its address", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  expect(p.text("open item")).toBe("a");
+  expect(p.text("page address")).toBe("/items?item=a#details");
+  expect(location(p)).toBe(`${server.url}/items?item=a#details`);
+});
+
+test("reload keeps the current pushed address rather than the initial deep link", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("open item b");
+  expect(p.text("open item")).toBe("b");
+  expect(p.text("popstate count")).toBe("0");
+  expect(location(p)).toBe(`${server.url}/items?item=b#details`);
+  await p.reload();
+  expect(p.text("open item")).toBe("b");
+  expect(p.text("page address")).toBe("/items?item=b#details");
+  expect(location(p)).toBe(`${server.url}/items?item=b#details`);
+});
+
+test("history back restores each address and delivers one popstate for each traversal", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("open item b");
+  await p.press("open item c");
+  expect(p.text("open item")).toBe("c");
+  expect(p.text("popstate count")).toBe("0");
+  await back(p);
+  expect(p.text("open item")).toBe("b");
+  expect(p.text("popstate count")).toBe("1");
+  expect(location(p)).toBe(`${server.url}/items?item=b#details`);
+  await back(p);
+  expect(p.text("open item")).toBe("a");
+  expect(p.text("popstate count")).toBe("2");
+  expect(location(p)).toBe(`${server.url}/items?item=a#details`);
+});
+
+test("reload keeps local and session drafts and IndexedDB without a server refill", async () => {
+  const p = await open();
+  await p.type("local draft", "local text");
+  await p.type("session draft", "session text");
+  await p.press("send x");
+  await p.signOut();
+  await p.reload();
+  expect(p.text("saved local draft")).toBe("local text");
+  expect(p.text("saved session draft")).toBe("session text");
+  expect(p.text("transactions")).toContain("seed:42");
+  expect(p.text("transactions")).toContain("x:9");
+  await p.press("probe identity");
+  expect(p.text("identity")).toMatch(/^401:/);
+});
+
+test("a new device clears local and session drafts and IndexedDB without changing the server or session", async () => {
+  const p = await open();
+  await p.type("local draft", "local text");
+  await p.type("session draft", "session text");
+  await p.press("send x");
+  expect(p.text("saved local draft")).toBe("local text");
+  expect(p.text("saved session draft")).toBe("session text");
+  expect(p.text("transactions")).toContain("x:9");
+  await p.signOut();
+  await p.reload({ device: "new" });
+  expect(p.text("saved local draft")).toBe("");
+  expect(p.text("saved session draft")).toBe("");
+  expect(p.text("transactions")).toBe("");
+  expect(server.store.rows("history").find((row) => row.id === "x")?.value).toBe(9);
+  await p.press("probe identity");
+  expect(p.text("identity")).toMatch(/^401:/);
 });
