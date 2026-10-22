@@ -63,7 +63,7 @@ const copy = (dataset: string, revision: number, value: number) => ({
 });
 
 // Adding a table keeps unchanged tables and opens the new one empty, with no number to bump by hand.
-// The kept rows claim revision zero until a reset replaces them; waiting commands keep their own history.
+// The kept rows retain their revision and owe a reset; waiting commands keep their own history.
 test("a table added without a version bump keeps the rows and the outbox", async () => {
   const factory = new IDBFactory();
   const name = `layout-${randomUUID()}`;
@@ -81,7 +81,8 @@ test("a table added without a version bump keeps the rows and the outbox", async
   await before.commit({ replica: copy("d1", 7, 1), reset: true, base: 0, replaces: null, ops: [] });
   const after = port(factory, name, [lens("rows"), lens("notes")]);
   const loaded = await after.load();
-  expect(loaded.replica).toMatchObject({ dataset: "d1", revision: 0, server: null });
+  expect(loaded.replica).toMatchObject({ dataset: "d1", revision: 7, server: null });
+  expect(loaded).toMatchObject({ restart: "paged" });
   expect([...loaded.replica.tables.rows.values()]).toStrictEqual([
     { id: "a", value: 1, deleted: false },
   ]);
