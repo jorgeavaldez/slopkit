@@ -1,5 +1,5 @@
 /** Contract choices: visit Map keys as well as values; shared/cyclic objects are checked once.
- * Sync debt is read literally from the model (even if a connection currently prevents progress).
+ * Sync debt counts only when the engine would start it; already in-flight work always counts.
  * A due idle push is work only with a command that is not done.
  */
 import { expect, test } from "vitest";
@@ -297,7 +297,7 @@ test("sync with no model, a quiet model, or only future retries is not underway"
   }
 });
 
-test.each([
+const inFlightSync = [
   ["booting", (m: M): M => ({ ...m, boot: { kind: "loading", since: now } })],
   ["pulling", (m: M): M => ({ ...m, pull: { kind: "pulling", since: 5, failures: 0 } })],
   [
@@ -308,6 +308,9 @@ test.each([
     }),
   ],
   ["writing", (m: M): M => ({ ...m, saved: { ...m.saved, writing: 1 } })],
+] as const;
+
+const owedPulls = [
   ["target ahead", (m: M): M => ({ ...m, target: 6 })],
   [
     "next history page",
@@ -321,6 +324,9 @@ test.each([
   ],
   ["pull due", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now, failures: 0 } })],
   ["pull overdue", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now - 1, failures: 0 } })],
+] as const;
+
+const duePushes = [
   [
     "push due",
     (m: M): M => ({
@@ -337,6 +343,86 @@ test.each([
       push: { kind: "idle", nextAt: now - 1, failures: 0 },
     }),
   ],
-] as const)("sync is real while %s", (_name, change) => {
-  expect(check(line("checking…", { sync: true }), world(change(quiet())))).toStrictEqual([]);
-});
+] as const;
+
+test.each([...inFlightSync, ...owedPulls, ...duePushes])(
+  "sync is real while %s",
+  (_name, change) => {
+    expect(check(line("checking…", { sync: true }), world(change(quiet())))).toStrictEqual([]);
+  }
+);
+
+test.each(owedPulls)(
+  "%s is not under way while hidden, signed out or incompatible",
+  (_name, change) => {
+    const owed = change(quiet());
+
+    for (const model of [
+      { ...owed, visible: false },
+      { ...owed, connection: { kind: "signed-out" as const } },
+      { ...owed, connection: { kind: "incompatible" as const, failure: "upgrade required" } },
+    ]) {
+      expect(check(line("checking…", { sync: true }), world(model))).toStrictEqual([badSync]);
+    }
+  }
+);
+
+test.each(owedPulls)(
+  "%s may start while visible with a starting, offline or stale connection",
+  (_name, change) => {
+    const owed = change(quiet());
+
+    for (const connection of [
+      { kind: "starting" as const },
+      { kind: "offline" as const, failure: "network down" },
+      { kind: "stale" as const },
+    ]) {
+      expect(
+        check(line("checking…", { sync: true }), world({ ...owed, connection }))
+      ).toStrictEqual([]);
+    }
+  }
+);
+
+test.each(duePushes)(
+  "%s with an unsent command needs a live or stale connection",
+  (_name, change) => {
+    const owed = change(quiet());
+
+    for (const connection of [
+      { kind: "starting" as const },
+      { kind: "offline" as const, failure: "network down" },
+      { kind: "signed-out" as const },
+      { kind: "incompatible" as const, failure: "upgrade required" },
+    ]) {
+      expect(
+        check(line("checking…", { sync: true }), world({ ...owed, connection }))
+      ).toStrictEqual([badSync]);
+    }
+
+    for (const connection of [{ kind: "live" as const }, { kind: "stale" as const }]) {
+      expect(
+        check(line("checking…", { sync: true }), world({ ...owed, connection }))
+      ).toStrictEqual([]);
+      expect(
+        check(line("checking…", { sync: true }), world({ ...owed, connection, visible: false }))
+      ).toStrictEqual([]);
+    }
+  }
+);
+
+test.each(inFlightSync)(
+  "%s still counts when hidden, signed out or incompatible",
+  (_name, change) => {
+    const busy = change(quiet());
+
+    for (const connection of [
+      { kind: "signed-out" as const },
+      { kind: "incompatible" as const, failure: "upgrade required" },
+    ]) {
+      expect(
+        check(line("checking…", { sync: true }), world({ ...busy, connection, visible: false }))
+      ).toStrictEqual([]);
+    }
+  }
+);
