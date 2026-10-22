@@ -21,15 +21,6 @@ type Options = {
   world?: (model: PageModel, step: number) => World;
 };
 
-type Replay = (
-  transition: typeof update,
-  initial: PageModel,
-  messages: readonly Message[],
-  options: Options
-) => Result;
-
-const checks: typeof stateChecks & { replayProblems?: Replay } = stateChecks;
-
 const ui = states<never>({ order: MEANINGS });
 
 const subject = ui.subject<{ kind: "ready" } | { kind: "working" } | { kind: "blank" }>("item", {
@@ -109,11 +100,13 @@ function view(model: PageModel) {
 const world = (model: PageModel): World => ({ now: model.now, model: model.sync, jobs: [] });
 
 function replay(model: PageModel, messages: readonly Message[], options: Partial<Options> = {}) {
-  if (!checks.replayProblems) {
-    throw new Error("replayProblems is not exported");
-  }
+  const replayed: Result = stateChecks.replayProblems(update, model, messages, {
+    view,
+    order: MEANINGS,
+    ...options,
+  });
 
-  return checks.replayProblems(update, model, messages, { view, order: MEANINGS, ...options });
+  return replayed;
 }
 
 test("a clean replay returns the last model and every effect in message order", () => {

@@ -1,14 +1,15 @@
+import type { Update } from "../machine.ts";
 /**
- * Checks an app's oracle runs on its state tables and screens (`slopkit/states`), for what the types can't rule out.
- * Each returns the problems found, empty when there are none, so a test asserts `toEqual([])` and reads every problem
- * at once. They check rules, never an app's expected texts: those stay the app's hand-written oracle.
+ * Checks an app's tests run on its state tables, screens and every view they reach (`slopkit/states`), for what the
+ * types can't rule out. Each returns the problems found, empty when there are none, so a test asserts `toEqual([])`
+ * and reads every problem at once. They check rules, never an app's expected texts: those stay the app's own tests.
  */
 import { isLine, isScreen } from "../states.ts";
 import type { Line, Meaning, Owed, Screen, Subject } from "../states.ts";
 import { deriveHistoryState, reachable, settled } from "../sync.ts";
 import type { Model } from "../sync.ts";
 
-/** At least one sample state of every kind, for the oracle and the gallery. */
+/** At least one sample state of every kind, for the tests and the gallery. */
 export type Samples<S extends { kind: string }> = {
   readonly [K in S["kind"]]: readonly [Extract<S, { kind: K }>, ...Extract<S, { kind: K }>[]];
 };
@@ -220,28 +221,39 @@ function found(value: unknown): Found {
 }
 
 // oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
-function syncUnderWay(model: Model<any, any, any, any>, now: number): boolean {
-  const history = deriveHistoryState(model).kind;
-  const unsent = model.commands.some((each) => each.state.kind !== "done");
+// oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
+type AnyModel = Model<any, any, any, any>;
+
+/** A pull in flight, or one the engine would start now: the page visible, the connection letting it, a pull owed. */
+function pullUnderWay(model: AnyModel, now: number): boolean {
   const connection = model.connection.kind;
-  // What the engine would start now: a pull while the page is visible and the connection lets it, a push while live.
   const canPull = model.visible && connection !== "signed-out" && connection !== "incompatible";
 
   const owesPull =
     model.target > model.replica.revision ||
-    history === "partial" ||
+    deriveHistoryState(model).kind === "partial" ||
     (model.pull.kind === "idle" && model.pull.nextAt <= now);
+
+  return model.pull.kind === "pulling" || (canPull && owesPull);
+}
+
+/** A push in flight, or one the engine would start now: the connection live or stale and no backoff pending. */
+function pushUnderWay(model: AnyModel, now: number): boolean {
+  return (
+    model.push.kind === "pushing" ||
+    (reachable(model.connection) && model.push.kind === "idle" && model.push.nextAt <= now)
+  );
+}
+
+function syncUnderWay(model: AnyModel, now: number): boolean {
+  const unsent = model.commands.some((each) => each.state.kind !== "done");
 
   return (
     model.boot.kind === "loading" ||
-    model.pull.kind === "pulling" ||
-    model.push.kind === "pushing" ||
     model.saved.writing > 0 ||
-    (canPull && owesPull) ||
-    (reachable(model.connection) &&
-      model.push.kind === "idle" &&
-      model.push.nextAt <= now &&
-      unsent)
+    model.push.kind === "pushing" ||
+    pullUnderWay(model, now) ||
+    (unsent && pushUnderWay(model, now))
   );
 }
 
@@ -274,7 +286,20 @@ function underWay(owed: Owed, world: World): boolean {
       (each) => each.client === owed.command.client && each.id === owed.command.id
     );
 
-    return command !== undefined && !settled(model, command);
+    if (command === undefined || settled(model, command)) {
+      return false;
+    }
+
+    const state = command.state;
+
+    // Sent or about to be: a push in flight or one the engine would start now. Answered or parked: a pull that brings it.
+    if (state.kind === "saving" || state.kind === "sending") {
+      return true;
+    }
+
+    return state.kind === "queued" || (state.kind === "unknown" && state.parked !== true)
+      ? pushUnderWay(model, world.now)
+      : pullUnderWay(model, world.now);
   }
 
   return syncUnderWay(model, world.now);
@@ -315,4 +340,51 @@ export function viewProblems(
   }
 
   return problems;
+}
+
+/** Where a replay ends (`replayProblems`): the last model, every effect, and each reached view's problems. */
+export type ReplayChecked<M, E> = { model: M; effects: E[]; problems: string[] };
+
+/**
+ * Replay `messages` through `update` from `initial` and run `viewProblems` on the view of every model reached: the
+ * initial one (step 0) and the one after each message (step n). `world` is drawn from each reached model (its sync
+ * model, its clock, the jobs the test supplies), never a snapshot. Returns the last model, every effect, and the
+ * problems, each naming its step.
+ */
+export function replayProblems<M, Msg, E>(
+  update: Update<M, Msg, E>,
+  initial: M,
+  messages: readonly Msg[],
+  options: {
+    // oxlint-disable-next-line anti-slop/no-unknown-returns -- an app's view is any shape; only the kit's classes are read
+    view: (model: M) => unknown;
+    order: readonly Meaning[];
+    world?: (model: M, step: number) => World;
+  }
+): ReplayChecked<M, E> {
+  const effects: E[] = [];
+  const problems: string[] = [];
+  let model = initial;
+
+  const check = (step: number) => {
+    const world = options.world?.(model, step);
+
+    problems.push(
+      ...viewProblems(options.view(model), {
+        order: options.order,
+        ...(world === undefined ? {} : { world }),
+      }).map((problem) => `step ${step}: ${problem}`)
+    );
+  };
+
+  check(0);
+
+  for (const [index, msg] of messages.entries()) {
+    const [next, produced] = update(model, msg);
+    model = next;
+    effects.push(...produced);
+    check(index + 1);
+  }
+
+  return { model, effects, problems };
 }

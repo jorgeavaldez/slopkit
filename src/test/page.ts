@@ -68,6 +68,8 @@ export type PageOptions<E> = {
   read?: (entry: E) => PageRead;
   /** When the clock starts: an instant or ms since the epoch. */
   at: string | number;
+  /** Where the page first loads, on the server: a deep link (default `/`). */
+  path?: string;
   /** The app's severity order, for the honest checks. */
   order?: readonly Meaning[];
   /** How far a settle waits for pending timeouts, in ms of the clock. */
@@ -99,8 +101,15 @@ export type Page = {
   text: (name?: string | RegExp) => string;
   /** The lines the view holds now. */
   lines: () => ReadLine[];
-  /** A new page load: fresh modules and DOM; this device's storage, or a new device's empty one. */
+  /**
+   * A new page load at the address the page is on: fresh modules and DOM; this device's storage (IndexedDB,
+   * localStorage, sessionStorage), or a new device's, empty.
+   */
   reload: (options?: { device?: "same" | "new" }) => Promise<void>;
+  /** The page's address, absolute. */
+  location: () => string;
+  /** History back within the page (an entry it pushed): the address moves and the page hears popstate; then settles. */
+  back: () => Promise<void>;
   /** Drops the session: the server then answers this page as no one. */
   signOut: () => Promise<void>;
   /** Signs in again through the stand-in. */
@@ -487,7 +496,17 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
 
     const nodeFetch = globalThis.fetch.bind(globalThis);
     let device = new IDBFactory();
+    /** The device's Web Storage, kept across page loads as a browser keeps it. */
+    let stored = { local: new Map<string, string>(), session: new Map<string, string>() };
+    let address = new URL(options.path ?? "/", base).href;
+    /**
+     * The tab's history, as a browser keeps it across a reload: each entry's address and state, and where the tab is.
+     * Recorded, never driven: the page's own history (happy-dom's) moves; a reload restores the entries up to here.
+     */
+    let trail: { url: string; state: unknown }[] = [];
+    let at = 0;
     let window: Window | undefined;
+
     let entry: E | undefined;
     let pageGlobals: (() => void)[] = [];
 
@@ -567,8 +586,23 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
     }
 
     const unload = async () => {
-      // The page goes as a closed tab does: its timers stop, its sockets close, and what it had in flight lands before
-      // its globals go, so nothing of it runs afterwards. The server's timers go on.
+      // The page goes as a closed tab does: it hears it is hidden and going (visibilitychange, pagehide) and may save,
+      // then its timers stop, its sockets close, and what it had in flight lands before its globals go, so nothing of
+      // it runs afterwards. The server's timers go on.
+      const going = window;
+
+      if (going !== undefined) {
+        Object.defineProperty(going.document, "visibilityState", {
+          value: "hidden",
+          configurable: true,
+        });
+        Object.defineProperty(going.document, "hidden", { value: true, configurable: true });
+        owner.run("page", () => {
+          going.document.dispatchEvent(new going.Event("visibilitychange"));
+          going.dispatchEvent(new going.PageTransitionEvent("pagehide"));
+        });
+        await quiet();
+      }
 
       pages();
 
@@ -585,6 +619,24 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
       pageGlobals = [];
 
       if (window !== undefined) {
+        address = window.location.href;
+        trail = trail.slice(0, at + 1);
+
+        for (const [into, from] of [
+          [stored.local, window.localStorage],
+          [stored.session, window.sessionStorage],
+        ] as const) {
+          into.clear();
+
+          for (let index = 0; index < from.length; index++) {
+            const key = from.key(index);
+
+            if (key !== null) {
+              into.set(key, from.getItem(key) ?? "");
+            }
+          }
+        }
+
         await window.happyDOM.abort();
         await window.happyDOM.close();
         window = undefined;
@@ -595,10 +647,67 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
 
     const load = async () => {
       window = new Window({
-        url: base.href,
+        url: trail[0]?.url ?? address,
         width: options.viewport?.width ?? 412,
         height: options.viewport?.height ?? 915,
       });
+
+      // The entries a reload keeps, back to the one the tab is on: same document, so going back fires popstate.
+      const history = window.history;
+      const push = history.pushState.bind(history);
+      const replace = history.replaceState.bind(history);
+
+      for (const kept of trail.slice(1)) {
+        push(kept.state, "", kept.url);
+      }
+
+      if (trail.length === 0) {
+        trail = [{ url: address, state: null }];
+      }
+
+      at = trail.length - 1;
+
+      history.pushState = (state: unknown, unused: string, url?: string | URL) => {
+        push(state, unused, url);
+        trail = [...trail.slice(0, at + 1), { url: window?.location.href ?? address, state }];
+        at = trail.length - 1;
+      };
+
+      history.replaceState = (state: unknown, unused: string, url?: string | URL) => {
+        replace(state, unused, url);
+        trail[at] = { url: window?.location.href ?? address, state };
+      };
+
+      window.addEventListener("popstate", () => {
+        const href = window?.location.href;
+        const near = [at - 1, at + 1].find((index) => trail[index]?.url === href);
+        at =
+          near ??
+          Math.max(
+            0,
+            trail.findIndex((each) => each.url === href)
+          );
+      });
+
+      // A hash the page set is a new entry; one that back or forward reached is already where popstate put the tab.
+      window.addEventListener("hashchange", () => {
+        if (trail[at]?.url === window?.location.href) {
+          return;
+        }
+
+        trail = [...trail.slice(0, at + 1), { url: window?.location.href ?? address, state: null }];
+        at = trail.length - 1;
+      });
+
+      for (const [from, into] of [
+        [stored.local, window.localStorage],
+        [stored.session, window.sessionStorage],
+      ] as const) {
+        for (const [key, value] of from) {
+          into.setItem(key, value);
+        }
+      }
+
       // The window's own timers and Date are the driver's, as the bare globals are.
 
       for (const key of ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "Date"]) {
@@ -922,11 +1031,33 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
           .trim();
       },
       lines,
+      location() {
+        return window?.location.href ?? address;
+      },
+      async back() {
+        const from = window?.location.href;
+        let heard = false;
+
+        window?.addEventListener(
+          "popstate",
+          () => {
+            heard = true;
+          },
+          { once: true }
+        );
+        owner.run("page", () => doc().defaultView?.history.back());
+        await settle();
+
+        if (!heard && window?.location.href === from) {
+          throw new Error("openPage: back() with nowhere to go back to");
+        }
+      },
       async reload(reloading = {}) {
         await unload();
 
         if (reloading.device === "new") {
           device = new IDBFactory();
+          stored = { local: new Map(), session: new Map() };
         }
 
         await load();

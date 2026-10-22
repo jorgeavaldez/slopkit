@@ -307,23 +307,11 @@ test("one page at a time; close releases the slot and stops its server", async (
 });
 
 function location(p: Awaited<ReturnType<typeof openPage>>): string {
-  const current: typeof p & { location?: () => string } = p;
-
-  if (!current.location) {
-    throw new Error("page.location is not available");
-  }
-
-  return current.location();
+  return p.location();
 }
 
 async function back(p: Awaited<ReturnType<typeof openPage>>) {
-  const current: typeof p & { back?: () => void | Promise<void> } = p;
-
-  if (!current.back) {
-    throw new Error("page.back is not available");
-  }
-
-  await current.back();
+  await p.back();
   await p.settle();
 }
 
