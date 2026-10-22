@@ -1,6 +1,6 @@
 # Rules for apps on slopkit
 
-Rules version: 1
+Rules version: 2
 
 The standard every app built on `slopkit` meets, and the kit itself. The aim is speed and correctness,
 solved once in the kit so every app built on it starts with these problems solved. Each rule is a property of the
@@ -56,9 +56,21 @@ What the screen can say is decided for every state, as a pure function of the ap
   with composition rules, not one giant enum. Prevents a concurrent fact being lost to another.
 - **Every state's display is decided, with its reason.** A typed table `satisfies Record<State["kind"], Display>` maps
   each state to where it is drawn (`main`: it changes what the person should believe about the numbers or needs them
-  to act; `badge`; `panel`; `log`), why, tone, glyph, text and action. A new state doesn't compile until it is placed.
+  to act; `badge`; `panel`; `log`), why, tone, glyph, text and action, and for a working state what it owes. A new
+  state doesn't compile until it is placed.
   Two states share a display only when the statement is true for both and implies the same safe action. A hidden state
   has a reason, and hiding it changes no claim or action.
+- **Working names what it waits on.** A working state's table entry names the work it waits on (a job, a command,
+  the page's own sync), and the state is drawn only while that work is under way. One whose work is the world's (a
+  parcel in transit) says so in its entry, with why. Prevents "checking…" on a check nobody runs.
+- **The page's own state is model state.** What changes what the screen says or what a tap does (the route and open
+  item, modes, open panels, filters and searches, selections, forms with drafts and applied values held apart, and
+  persisted view settings) is part of the model. It changes only through the model's pure `update` (a message in; the
+  model and effects out), so a replay of messages reaches it like the rest of the model. The address and storage are
+  read once at load and written as effects, so a deep link opens the screen navigating there does, back returns, and
+  a reload keeps what was set on that device. The numbers never read a form's draft. Focus, hover, scroll and
+  animation stay in the browser unless the view changes with them. Prevents a selection that moves the numbers with
+  no state of its own.
 - **Never claim more than is true.** Order by placement, then severity, with each app setting its own severity order
   by consequence. Facts that change what the numbers mean (incomplete, possibly wrong, not saved, stale) sit next to
   the numbers and are never folded into a count behind another headline; a headline may lead with an action (sign in
@@ -78,8 +90,10 @@ What the screen can say is decided for every state, as a pure function of the ap
   and accessibility violations fail the build. No new colours, boxes or spinners.
 - **Verified over the whole catalog.** Tests enumerate every state and bounded combinations through the real engine
   and `view`: placement holds, states needing different actions never render the same text, and no number is shown
-  without its claim-critical facts. Every state can also be drawn on its own at phone size (a gallery of the catalog),
-  so each display can be seen as rendered.
+  without its claim-critical facts. Every view an app's tests reach (replayed messages, the app's real page driven
+  headless) passes the kit's `viewProblems`: no broken value, "ok" only when every part is, claims kept whole, and
+  every working line's owed work under way. Every state can also be drawn on its own at phone size (a gallery of the
+  catalog), so each display can be seen as rendered.
 
 ## 4. Outside services
 
@@ -154,7 +168,9 @@ work up.
   overlap, interrupted commits, shared storage, identity changes, reconnects. More happy paths or seeds can't cover a missing failure dimension.
 - Headless correctness doesn't prove the UI binding: a renderer can drop a recovery button or swap actions while
   `view()` passes. Thin rendering and binding checks prove each action in `view` reaches the right command and each
-  warning is drawn, in each target browser (Safari and iOS PWA storage differ). A packed-consumer check proves the app
+  warning is drawn, on the app's real page driven headless, and in each target browser for what a DOM shim can't
+  show: layout and overflow, and platform bindings (a popup inside the tap, storage persistence, the service worker;
+  Safari and iOS PWA storage differ). A packed-consumer check proves the app
   runs the kit as shipped.
 - Tiers: pure model tests in milliseconds; a seeded headless end-to-end gate in seconds; adapter and binding checks; a
   read-only check of the deployed app on synthetic data.
@@ -202,7 +218,11 @@ Performance is a requirement, aimed at the limits of every service and system in
 - **Dependencies.** Few, from `DEPS.md`, so apps stay small. Few never means hand-rolled crypto, JWT, protocol parsers
   or weaker storage semantics: those use a vetted library (for example `jose`).
 - **Defaults:** IndexedDB in the browser (SQLite in the browser only where demonstrably better); SQLite on the server;
-  OIDC login, or Cloudflare Access's signed header where deployed; logins added in the UI.
+  logins to outside accounts added in the UI.
+- **Its own login.** An app signs people in itself, with OpenID Connect, and serves on a local binding. An
+  identity-aware proxy in front (Cloudflare Access's signed header) is an optional outer door, never the app's login.
+  A test identity (the kit's OIDC stand-in) signs in on a test home, so the app is proven end to end without a real
+  login.
 - **Look.** Brutalist, mobile-first PWAs: dense, monospace, black and white, no shadows or rounded corners.
 - Shipped source is generic: no hostnames, accounts or private data in code or docs; private data lives in the app's
   data directory and configuration.

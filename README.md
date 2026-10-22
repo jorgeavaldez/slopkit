@@ -73,6 +73,14 @@ const { model, effects } = replay(update, { kind: "draft" }, [
 view.line(model).text; // "saved?", drawn ⚠ with a check action
 effects; // [{ kind: "send", text: "hi" }], one send
 
+// the page's own state (route, filters, applied forms) lives in the model too, so every view a replay reaches is checked
+const { problems } = replayProblems(update, { kind: "draft" }, messages, { view: (note) => view.line(note), order: MEANINGS });
+
+// the app's real page, headless, over its own server in this process, signed in by the test login
+const page = await openPage({ server, page: () => import("../src/web/main.tsx"), at: "2026-01-01T12:00:00Z", path: "/?note=a" });
+await page.press(/save/); // by accessible name; settles, then checks the view
+await page.reload(); // same device: IndexedDB, localStorage, sessionStorage and the address kept
+
 // the page calls it, and the server answers after checking the login, the request and the reply
 const sent = await call(save, { text: "hi" }); // { ok: true, value: { id } } or a typed failure
 await serveWeb({
