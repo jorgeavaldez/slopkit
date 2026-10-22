@@ -561,6 +561,13 @@ test("a command kept without since takes the lifted revision on the second offli
     runtime.stop();
   }
 
+  expect(n.pushes).toStrictEqual([]);
+  n.connect();
+  const online = createRuntime(runtimeOptions(f, n.host));
+  onTestFinished(() => online.stop());
+  online.start();
+  await online.settle();
+  expect(online.model().replica.revision).toBe(9);
   expect(n.pushes.length).toBeGreaterThan(0);
 
   for (const push of n.pushes) {
