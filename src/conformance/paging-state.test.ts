@@ -44,6 +44,7 @@ const working = {
   why: "the copy is loading",
   text: () => "loading copy",
   action: null,
+  owes: () => ({ sync: true as const }),
 } as const;
 
 const warning = {

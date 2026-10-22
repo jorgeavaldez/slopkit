@@ -72,22 +72,54 @@ export const LOOKS = {
  */
 export type Place = "main" | "badge" | "panel" | "log";
 
-type Placed =
-  | { readonly meaning: "ok"; readonly where: Place; readonly claim: false }
-  | { readonly meaning: "partial" | "stale"; readonly where: "main"; readonly claim: true }
+/**
+ * The work a `working` state waits on, so it can be checked to be under way (`slopkit/test/states` `viewProblems`): the
+ * server's job of a kind and key, a command in the page's outbox, or the page's own copy (loading, pulling, pushing,
+ * writing). A working state that owes nothing of the app's (the world is at work: a parcel in transit) says `owes: null`.
+ */
+export type Owed =
+  | { readonly job: { readonly kind: string; readonly key: string } }
+  | { readonly command: { readonly client: string; readonly id: number } }
+  | { readonly sync: true };
+
+type Others = Exclude<Meaning, "ok" | "partial" | "stale" | "working">;
+
+type Placed<S> =
+  | { readonly meaning: "ok"; readonly where: Place; readonly claim: false; readonly owes?: never }
   | {
-      readonly meaning: Exclude<Meaning, "ok" | "partial" | "stale">;
+      readonly meaning: "partial" | "stale";
       readonly where: "main";
-      readonly claim: boolean;
+      readonly claim: true;
+      readonly owes?: never;
     }
   | {
-      readonly meaning: Exclude<Meaning, "ok" | "partial" | "stale">;
+      readonly meaning: Others;
+      readonly where: "main";
+      readonly claim: boolean;
+      readonly owes?: never;
+    }
+  | {
+      readonly meaning: Others;
       readonly where: "badge";
       readonly claim: false;
+      readonly owes?: never;
+    }
+  | {
+      readonly meaning: "working";
+      readonly where: "main";
+      readonly claim: boolean;
+      /** What is at work: checked to be under way whenever this is drawn. Required. */
+      readonly owes: ((state: S) => Owed) | null;
+    }
+  | {
+      readonly meaning: "working";
+      readonly where: "badge";
+      readonly claim: false;
+      readonly owes: ((state: S) => Owed) | null;
     };
 
 /** One state's display: what it means, where and why it is drawn, its words, and what the person can do. */
-export type Display<S, A> = Placed & {
+export type Display<S, A> = Placed<S> & {
   /** Why it is drawn there, or not at all. Required. */
   readonly why: string;
   readonly text: (state: S) => string;
@@ -99,13 +131,40 @@ export type Table<S extends { kind: string }, A> = {
   readonly [K in S["kind"]]: Display<Extract<S, { kind: K }>, A>;
 };
 
+/**
+ * Brands a Line and a Screen carry, so a check holding one copy of this module still knows another copy's (a fresh
+ * module graph for each page load in a test, two installed versions).
+ */
+const LINE = Symbol.for("slopkit.states.Line");
+const SCREEN = Symbol.for("slopkit.states.Screen");
+
+/** Whether a value is a Line, made by any copy of this module. */
+export function isLine(value: unknown): value is Line<unknown> {
+  return typeof value === "object" && value !== null && LINE in value;
+}
+
+/** Whether a value is a Screen, made by any copy of this module. */
+export function isScreen(value: unknown): value is Screen<unknown> {
+  return typeof value === "object" && value !== null && SCREEN in value;
+}
+
 // Set by the classes' static blocks: nothing outside this module can make a Line or a Screen.
 let makeLine: <A>(fields: LineFields<A>) => Line<A>;
 let makeScreen: <A>(fields: ScreenFields<A>) => Screen<A>;
 
 type LineFields<A> = {
   [
-    K in "subject" | "kind" | "meaning" | "where" | "claim" | "glyph" | "tone" | "text" | "action"
+    K in
+      | "subject"
+      | "kind"
+      | "meaning"
+      | "where"
+      | "claim"
+      | "glyph"
+      | "tone"
+      | "text"
+      | "action"
+      | "owed"
   ]: Line<A>[K];
 };
 
@@ -118,6 +177,7 @@ export class Line<A> {
   // A private field makes the type nominal: no object literal or spread of a Line is one.
   // oxlint-disable-next-line no-unused-private-class-members -- its presence is its use
   readonly #made = true;
+  readonly [LINE] = true;
   readonly subject: string;
   readonly kind: string;
   readonly meaning: Meaning;
@@ -127,6 +187,8 @@ export class Line<A> {
   readonly tone: Tone;
   readonly text: string;
   readonly action: A | null;
+  /** The work a working state waits on (its table's `owes`), or null. */
+  readonly owed: Owed | null;
   private constructor(fields: LineFields<A>) {
     this.subject = fields.subject;
     this.kind = fields.kind;
@@ -137,6 +199,7 @@ export class Line<A> {
     this.tone = fields.tone;
     this.text = fields.text;
     this.action = fields.action;
+    this.owed = fields.owed;
   }
   static {
     makeLine = (fields) => new Line(fields);
@@ -147,6 +210,7 @@ export class Line<A> {
 export class Screen<A> {
   // oxlint-disable-next-line no-unused-private-class-members -- nominal, as Line's
   readonly #made = true;
+  readonly [SCREEN] = true;
   /** Every part is ok. */
   readonly ok: boolean;
   /** The status line: the first part that isn't ok (by placement, severity, order), or the ok text; `more` counts the rest. */
@@ -348,6 +412,7 @@ export function states<A>(options: {
           tone: look.tone,
           text,
           action: display.action,
+          owed: display.meaning === "working" && display.owes !== null ? display.owes(state) : null,
         });
       },
     };

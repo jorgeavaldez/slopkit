@@ -59,7 +59,8 @@ const update: Update<Note, Msg, Effect> = (note, msg) => {
 const ui = states<"check">({ order: MEANINGS });
 const view = ui.subject<Note>("note", {
   draft: { meaning: "none", where: "main", claim: false, why: "unsent", text: () => "draft", action: null },
-  saving: { meaning: "working", where: "main", claim: false, why: "sent", text: () => "saving", action: null },
+  saving: { meaning: "working", where: "main", claim: false, why: "sent", text: () => "saving", action: null,
+    owes: () => ({ sync: true }) }, // a working state names its work, checked to be under way
   saved: { meaning: "ok", where: "main", claim: false, why: "kept", text: () => "saved", action: null },
   unsure: { meaning: "you", where: "main", claim: true, why: "may have saved", text: () => "saved?", action: "check" },
 });

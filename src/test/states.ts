@@ -3,7 +3,10 @@
  * Each returns the problems found, empty when there are none, so a test asserts `toEqual([])` and reads every problem
  * at once. They check rules, never an app's expected texts: those stay the app's hand-written oracle.
  */
-import type { Line, Screen, Subject } from "../states.ts";
+import { isLine, isScreen } from "../states.ts";
+import type { Line, Meaning, Owed, Screen, Subject } from "../states.ts";
+import { deriveHistoryState, reachable, settled } from "../sync.ts";
+import type { Model } from "../sync.ts";
 
 /** At least one sample state of every kind, for the oracle and the gallery. */
 export type Samples<S extends { kind: string }> = {
@@ -154,4 +157,162 @@ export function bounded<T>(choices: readonly (readonly T[])[], limit: number): T
   }
 
   return out;
+}
+
+/** What is under way when a view is drawn: the server's jobs, the page's sync model, and the clock. */
+export type World = {
+  now: number;
+  /** The server's jobs (`slopkit/server/jobs`); finished ones may be listed too. */
+  jobs?: readonly {
+    kind: string;
+    key: string;
+    state: "due" | "running" | "done" | "failed";
+    dueAt: string;
+  }[];
+  /** The page's sync model: its commands and its copy. */
+  // oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
+  model?: Model<any, any, any, any>;
+};
+
+type Found = { lines: Line<unknown>[]; screens: Screen<unknown>[] };
+
+/** Every Line and Screen inside a value: objects, arrays, Maps and Sets, each visited once. */
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- an app's view is any shape; only the kit's classes are read
+function found(value: unknown): Found {
+  const drawn: Line<unknown>[] = [];
+  const screens: Screen<unknown>[] = [];
+  const seen = new Set<object>();
+
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- walks any shape, keeping only the kit's classes
+  const visit = (each: unknown): void => {
+    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- only objects can hold a Line or a Screen
+    if (typeof each !== "object" || each === null || seen.has(each)) {
+      return;
+    }
+
+    seen.add(each);
+
+    if (isLine(each)) {
+      drawn.push(each);
+
+      return;
+    }
+
+    if (isScreen(each)) {
+      screens.push(each);
+    }
+
+    const inner: Iterable<unknown> =
+      each instanceof Map
+        ? [...each.keys(), ...each.values()]
+        : each instanceof Set || Array.isArray(each)
+          ? each
+          : Object.values(each);
+
+    for (const item of inner) {
+      visit(item);
+    }
+  };
+
+  visit(value);
+
+  return { lines: drawn, screens };
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
+function syncUnderWay(model: Model<any, any, any, any>, now: number): boolean {
+  const history = deriveHistoryState(model).kind;
+  const unsent = model.commands.some((each) => each.state.kind !== "done");
+  const connection = model.connection.kind;
+  // What the engine would start now: a pull while the page is visible and the connection lets it, a push while live.
+  const canPull = model.visible && connection !== "signed-out" && connection !== "incompatible";
+
+  const owesPull =
+    model.target > model.replica.revision ||
+    history === "partial" ||
+    (model.pull.kind === "idle" && model.pull.nextAt <= now);
+
+  return (
+    model.boot.kind === "loading" ||
+    model.pull.kind === "pulling" ||
+    model.push.kind === "pushing" ||
+    model.saved.writing > 0 ||
+    (canPull && owesPull) ||
+    (reachable(model.connection) &&
+      model.push.kind === "idle" &&
+      model.push.nextAt <= now &&
+      unsent)
+  );
+}
+
+function owedName(owed: Owed): string {
+  if ("job" in owed) {
+    return `job ${owed.job.kind}:${owed.job.key}`;
+  }
+
+  return "command" in owed ? `command ${owed.command.client}:${owed.command.id}` : "sync";
+}
+
+function underWay(owed: Owed, world: World): boolean {
+  if ("job" in owed) {
+    return (world.jobs ?? []).some(
+      (job) =>
+        job.kind === owed.job.kind &&
+        job.key === owed.job.key &&
+        (job.state === "running" || (job.state === "due" && Date.parse(job.dueAt) <= world.now))
+    );
+  }
+
+  const model = world.model;
+
+  if (model === undefined) {
+    return false;
+  }
+
+  if ("command" in owed) {
+    const command = model.commands.find(
+      (each) => each.client === owed.command.client && each.id === owed.command.id
+    );
+
+    return command !== undefined && !settled(model, command);
+  }
+
+  return syncUnderWay(model, world.now);
+}
+
+/**
+ * A reached view's problems by the kit's rules: every line has text with no broken value; every screen keeps its parts
+ * (`screenProblems`); and, given what is under way (`world`), every working line's owed work is: a job running or due by
+ * now, a command not yet settled, or the page's copy loading, pulling, pushing or writing. Takes any value an app's view
+ * returns and finds the kit's lines and screens in it. Run it on every view a test reaches, not only on samples.
+ */
+export function viewProblems(
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- an app's view is any shape; only the kit's classes are read
+  shown: unknown,
+  options: { order: readonly Meaning[]; world?: World }
+): string[] {
+  const problems: string[] = [];
+  const { lines: drawn, screens } = found(shown);
+
+  for (const line of drawn) {
+    if (line.text.trim() === "") {
+      problems.push(`${line.subject}.${line.kind}: no text`);
+    } else if (BROKEN.test(line.text)) {
+      problems.push(`${line.subject}.${line.kind}: "${line.text}" shows a broken value`);
+    }
+
+    const world = options.world;
+
+    if (world !== undefined && line.owed !== null && !underWay(line.owed, world)) {
+      problems.push(
+        `${line.subject}.${line.kind} says "${line.text}" (working) but owes ${owedName(line.owed)}, which isn't under way`
+      );
+    }
+  }
+
+  for (const screen of screens) {
+    problems.push(...screenProblems(screen, screen.parts, options.order));
+  }
+
+  return problems;
 }

@@ -21,7 +21,7 @@ import { build } from "esbuild";
  * The kit's client core (`DEPS.md`), minified and gzipped together: it grows only with a new entry or guarantee, by its
  * measured size. `cron` is browser-safe but outside the core.
  */
-const BROWSER_BUDGET_GZIP_BYTES = 16_379;
+const BROWSER_BUDGET_GZIP_BYTES = 16_486;
 
 const BROWSER = [
   "schema",
@@ -110,6 +110,7 @@ try {
       devDependencies: {
         "@types/node": devVersion("@types/node"),
         "fake-indexeddb": devVersion("fake-indexeddb"),
+        "happy-dom": devVersion("happy-dom"),
         typescript: devVersion("typescript"),
         vitest: devVersion("vitest"),
       },

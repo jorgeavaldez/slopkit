@@ -57,6 +57,7 @@ const table: Table<State, Action> = {
     why: "Tap waits, numbers unchanged",
     text: () => "keeping the tap",
     action: null,
+    owes: null,
   },
 };
 
@@ -347,14 +348,24 @@ describe("states: independent conformance", () => {
                     text: () => meaning,
                     action: null,
                   }
-                : {
-                    meaning,
-                    where: "main",
-                    claim: false,
-                    why: "An obligation",
-                    text: () => meaning,
-                    action: null,
-                  },
+                : meaning === "working"
+                  ? {
+                      meaning,
+                      where: "main",
+                      claim: false,
+                      why: "An obligation",
+                      text: () => meaning,
+                      action: null,
+                      owes: null,
+                    }
+                  : {
+                      meaning,
+                      where: "main",
+                      claim: false,
+                      why: "An obligation",
+                      text: () => meaning,
+                      action: null,
+                    },
         })
         .line({ kind: "x" })
     );

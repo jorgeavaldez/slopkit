@@ -146,6 +146,10 @@
       "types": "./dist/test/states.d.ts",
       "default": "./dist/test/states.js"
     },
+    "./test/page": {
+      "types": "./dist/test/page.d.ts",
+      "default": "./dist/test/page.js"
+    },
     "./conformance/fixtures": {
       "types": "./dist/conformance/fixtures.d.ts",
       "default": "./dist/conformance/fixtures.js"
@@ -173,20 +177,26 @@
     "@types/ws": "8.18.2",
     "esbuild": "0.28.2",
     "fake-indexeddb": "6.2.6",
+    "happy-dom": "21.0.4",
     "knip": "6.42.1",
     "oxfmt": "0.71.0",
     "oxlint": "1.86.0",
     "oxlint-tsgolint": "7.0.2004",
+    "preact": "11.0.1",
     "typescript": "^7.0.2",
     "ultracite": "8.0.1",
     "vitest": "4.1.11"
   },
   "peerDependencies": {
     "fake-indexeddb": "^6.2.6",
+    "happy-dom": "^21.0.4",
     "vitest": "^4.1.11"
   },
   "peerDependenciesMeta": {
     "fake-indexeddb": {
+      "optional": true
+    },
+    "happy-dom": {
       "optional": true
     },
     "vitest": {
