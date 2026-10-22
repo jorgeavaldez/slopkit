@@ -6,7 +6,7 @@ import type { Update } from "../machine.ts";
  */
 import { isLine, isScreen } from "../states.ts";
 import type { Line, Meaning, Owed, Screen, Subject } from "../states.ts";
-import { deriveHistoryState, reachable, settled } from "../sync.ts";
+import { underWay } from "../sync.ts";
 import type { Model } from "../sync.ts";
 
 /** At least one sample state of every kind, for the tests and the gallery. */
@@ -220,49 +220,6 @@ function found(value: unknown): Found {
   return { lines: drawn, screens };
 }
 
-// oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
-type AnyModel = Model<any, any, any, any>;
-
-/** A pull in flight, or one the engine would start now: the page visible, the connection letting it, a pull owed. */
-function pullUnderWay(model: AnyModel, now: number): boolean {
-  if (model.pull.kind === "pulling") {
-    return true;
-  }
-
-  const connection = model.connection.kind;
-  const canPull = model.visible && connection !== "signed-out" && connection !== "incompatible";
-
-  const owed =
-    model.restart !== null ||
-    model.target > model.replica.revision ||
-    deriveHistoryState(model).kind === "partial";
-
-  // As the engine starts one: an owed pull right away unless it is in backoff, any pull once its retry is due.
-  const due = model.pull.nextAt <= now;
-
-  return canPull && (due || (owed && model.pull.failures === 0));
-}
-
-/** A push in flight, or one the engine would start now: the connection live or stale and no backoff pending. */
-function pushUnderWay(model: AnyModel, now: number): boolean {
-  return (
-    model.push.kind === "pushing" ||
-    (reachable(model.connection) && model.push.kind === "idle" && model.push.nextAt <= now)
-  );
-}
-
-function syncUnderWay(model: AnyModel, now: number): boolean {
-  const unsent = model.commands.some((each) => each.state.kind !== "done");
-
-  return (
-    model.boot.kind === "loading" ||
-    model.saved.writing > 0 ||
-    model.push.kind === "pushing" ||
-    pullUnderWay(model, now) ||
-    (unsent && pushUnderWay(model, now))
-  );
-}
-
 function owedName(owed: Owed): string {
   if ("job" in owed) {
     return `job ${owed.job.kind}:${owed.job.key}`;
@@ -271,7 +228,8 @@ function owedName(owed: Owed): string {
   return "command" in owed ? `command ${owed.command.client}:${owed.command.id}` : "sync";
 }
 
-function underWay(owed: Owed, world: World): boolean {
+/** A job running or due by now; the page's sync work as the engine runs it (`slopkit/sync`'s `underWay`). */
+function owedUnderWay(owed: Owed, world: World): boolean {
   if ("job" in owed) {
     return (world.jobs ?? []).some(
       (job) =>
@@ -281,40 +239,14 @@ function underWay(owed: Owed, world: World): boolean {
     );
   }
 
-  const model = world.model;
-
-  if (model === undefined) {
-    return false;
-  }
-
-  if ("command" in owed) {
-    const command = model.commands.find(
-      (each) => each.client === owed.command.client && each.id === owed.command.id
-    );
-
-    if (command === undefined || settled(model, command)) {
-      return false;
-    }
-
-    const state = command.state;
-
-    // Sent or about to be: a push in flight or one the engine would start now. Answered or parked: a pull that brings it.
-    if (state.kind === "saving" || state.kind === "sending") {
-      return true;
-    }
-
-    return state.kind === "queued" || (state.kind === "unknown" && state.parked !== true)
-      ? pushUnderWay(model, world.now)
-      : pullUnderWay(model, world.now);
-  }
-
-  return syncUnderWay(model, world.now);
+  return world.model !== undefined && underWay(world.model, owed, world.now);
 }
 
 /**
  * A reached view's problems by the kit's rules: every line has text with no broken value; every screen keeps its parts
  * (`screenProblems`); and, given what is under way (`world`), every working line's owed work is: a job running or due by
- * now, a command not yet settled, or the page's copy loading, pulling, pushing or writing. Takes any value an app's view
+ * now, or the page's sync work as the engine runs it (`slopkit/sync`'s `underWay`, the rule an app places its working
+ * lines by). Takes any value an app's view
  * returns and finds the kit's lines and screens in it. Run it on every view a test reaches, not only on samples.
  */
 export function viewProblems(
@@ -334,7 +266,7 @@ export function viewProblems(
 
     const world = options.world;
 
-    if (world !== undefined && line.owed !== null && !underWay(line.owed, world)) {
+    if (world !== undefined && line.owed !== null && !owedUnderWay(line.owed, world)) {
       problems.push(
         `${line.subject}.${line.kind} says "${line.text}" (working) but owes ${owedName(line.owed)}, which isn't under way`
       );

@@ -26,6 +26,9 @@ function quiet(): M {
     ...model,
     boot: { kind: "ready" },
     connection: { kind: "live" },
+    // Quiet as the engine leaves a page: the socket just heard, the session's self-check done.
+    socket: { open: true, heardAt: now },
+    verify: { kind: "done", match: true },
     replica: { ...model.replica, dataset: "fixture", revision: 5 },
     saved: { ...model.saved, dataset: "fixture", revision: 5, writing: 0 },
     target: 5,
@@ -380,9 +383,29 @@ const owedPulls = [
       },
     }),
   ],
-  ["pull due", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now, failures: 0 } })],
-  ["pull overdue", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now - 1, failures: 0 } })],
+  // A poll: due with the socket gone quiet (a live socket's pokes stand in for polling).
+  [
+    "poll due",
+    (m: M): M => ({
+      ...m,
+      connection: { kind: "stale" },
+      pull: { kind: "idle", nextAt: now, failures: 0 },
+    }),
+  ],
+  [
+    "poll overdue",
+    (m: M): M => ({
+      ...m,
+      connection: { kind: "stale" },
+      pull: { kind: "idle", nextAt: now - 1, failures: 0 },
+    }),
+  ],
 ] as const;
+
+test("a pull due on a live socket with nothing owed isn't under way: the engine waits for its pokes", () => {
+  const model: M = { ...quiet(), pull: { kind: "idle", nextAt: now - 1, failures: 0 } };
+  expect(check(line("checking…", { sync: true }), world(model))).toStrictEqual([badSync]);
+});
 
 const awaitingPull: Pending<Command, Outcome>["state"][] = [
   done(6),

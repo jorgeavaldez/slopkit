@@ -650,6 +650,127 @@ export function settled<T, S, C, O>(model: Model<T, S, C, O>, pending: Pending<C
   );
 }
 
+const blocked = (connection: Connection) =>
+  connection.kind === "signed-out" || connection.kind === "incompatible";
+
+/** The link as the engine finds it at `now`: a live socket not heard from within its deadline is stale. */
+const linkAt = (model: Model<unknown, unknown, unknown, unknown>, now: number): Connection =>
+  model.connection.kind === "live" && now - model.socket.heardAt >= SOCKET_DEADLINE_MS
+    ? { kind: "stale" }
+    : model.connection;
+
+/**
+ * Whether the engine starts a pull at `now` (one isn't in flight): the copy loaded, the page visible, the server not
+ * refusing it, and either a pull owed (behind, a page or a reset to fetch, its self-check) and not in backoff, or a
+ * poll due (the socket isn't live, a command's effects are still to come, or the app's `outstanding`).
+ */
+function pullStarts(
+  model: Model<unknown, unknown, unknown, unknown>,
+  now: number,
+  connection: Connection,
+  outstanding: boolean
+): boolean {
+  if (
+    model.boot.kind !== "ready" ||
+    model.pull.kind !== "idle" ||
+    !model.visible ||
+    blocked(connection)
+  ) {
+    return false;
+  }
+
+  const history = historyOf(model.replica);
+
+  const verifying =
+    model.verify.kind === "pending" && (history.kind === "complete" || model.restart === "whole");
+
+  const owed =
+    model.replica.revision < model.target ||
+    verifying ||
+    history.kind === "partial" ||
+    model.restart !== null;
+
+  const unsettled = model.commands.some(
+    (each) => each.state.kind === "done" && !settled(model, each)
+  );
+
+  const polling = connection.kind !== "live" || unsettled || outstanding;
+  const due = now >= model.pull.nextAt;
+
+  return (owed && (model.pull.failures === 0 || due)) || (polling && due);
+}
+
+/** Whether the engine sends a push at `now`, given something waiting: none in flight, no backoff, the server reachable. */
+function pushStarts(
+  model: Model<unknown, unknown, unknown, unknown>,
+  now: number,
+  connection: Connection
+): boolean {
+  return model.push.kind === "idle" && now >= model.push.nextAt && reachable(connection);
+}
+
+/**
+ * A pull in flight, or one the engine starts at `now`: what a line waiting on a pull (a command's effects, the copy
+ * catching up) may be drawn as working by. An app's own `outstanding` can make the engine poll too; that poll is the
+ * app's job's, not counted here.
+ */
+export function pullUnderWay<T, S, C, O>(model: Model<T, S, C, O>, now: number): boolean {
+  return model.pull.kind === "pulling" || pullStarts(model, now, linkAt(model, now), false);
+}
+
+/** A push in flight, or one the engine sends at `now` if a command waits: the link up and no backoff pending. */
+export function pushUnderWay<T, S, C, O>(model: Model<T, S, C, O>, now: number): boolean {
+  return model.push.kind === "pushing" || pushStarts(model, now, linkAt(model, now));
+}
+
+/** What a working line can owe the page's sync: one command (any page's), or the copy itself. */
+export type SyncOwed =
+  | { readonly command: { readonly client: string; readonly id: number } }
+  | { readonly sync: true };
+
+/**
+ * Whether the work a line owes is under way at `now`, as the engine runs it: a working line is drawn only while this
+ * holds, and is placed otherwise (a command queued offline or in backoff waits; it doesn't send). A command: being kept
+ * or sent; waiting to send and a push going or starting; answered or parked and a pull going or starting; never once
+ * settled or not on the page. The copy: loading, writing, pushing, or a pull going or starting, or a push for a
+ * command waiting.
+ */
+export function underWay<T, S, C, O>(
+  model: Model<T, S, C, O>,
+  owed: SyncOwed,
+  now: number
+): boolean {
+  if ("command" in owed) {
+    const command = model.commands.find(
+      (each) => each.client === owed.command.client && each.id === owed.command.id
+    );
+
+    if (command === undefined || settled(model, command)) {
+      return false;
+    }
+
+    const { state } = command;
+
+    if (state.kind === "saving" || state.kind === "sending") {
+      return true;
+    }
+
+    return state.kind === "queued" || (state.kind === "unknown" && state.parked !== true)
+      ? pushUnderWay(model, now)
+      : pullUnderWay(model, now);
+  }
+
+  const unsent = model.commands.some((each) => each.state.kind !== "done");
+
+  return (
+    model.boot.kind === "loading" ||
+    model.saved.writing > 0 ||
+    model.push.kind === "pushing" ||
+    pullUnderWay(model, now) ||
+    (unsent && pushUnderWay(model, now))
+  );
+}
+
 /**
  * Whether what the page shows is also on the disk: by revision only, so tabs at different cursors never chase each
  * other's writes. A failed write is owed again even at the same revision (a page that failed to land).
@@ -777,9 +898,6 @@ function working<T, S, C, O>(model: Model<T, S, C, O>): Storage {
     ? { kind: "ok" }
     : model.storage;
 }
-
-const blocked = (connection: Connection) =>
-  connection.kind === "signed-out" || connection.kind === "incompatible";
 
 const backoff = (failures: number) =>
   Math.min(BACKOFF_MAX_MS, POLL_MS * 2 ** Math.max(0, failures - 1));
@@ -992,66 +1110,55 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
     const out = [...effects];
     const now = next.now;
 
-    if (ready(next) && next.pull.kind === "idle" && next.visible && !blocked(next.connection)) {
+    // When a pull starts is `pullStarts`, the same rule `underWay` tells the page by.
+    if (
+      next.pull.kind === "idle" &&
+      pullStarts(next, now, next.connection, spec.outstanding?.(next.replica) ?? false)
+    ) {
       const failures = next.pull.failures;
-      const due = now >= next.pull.nextAt;
-      const behind = next.replica.revision < next.target;
-
-      const unsettled = next.commands.some(
-        (each) => each.state.kind === "done" && !settled(next, each)
-      );
-
-      const polling =
-        next.connection.kind !== "live" || unsettled || (spec.outstanding?.(next.replica) ?? false);
-
       const history = historyOf(next.replica);
       const whole = next.restart === "whole";
       // Only a complete copy is checked: a fingerprint of everything can't certify part of it.
       const verifying = next.verify.kind === "pending" && (history.kind === "complete" || whole);
-      // A partial copy owes its next page, back to back, until it is complete.
-      const owed = behind || verifying || history.kind === "partial" || next.restart !== null;
       const since = next.restart === null ? next.replica.revision : 0;
+      const current = next;
 
-      if ((owed && (failures === 0 || due)) || (polling && due)) {
-        const current = next;
+      // Commands waiting on an outcome or on their effects, at most a push's worth: their receipts come back with
+      // the rows they name. When more wait, each pull names the next ones round, so every one is asked about in
+      // turn (a parked command has no other way to settle).
+      const waiting = current.commands
+        .filter(
+          (each) =>
+            each.state.kind === "sending" ||
+            each.state.kind === "unknown" ||
+            (each.state.kind === "done" && !settled(current, each))
+        )
+        .map((each) => ({ client: each.client, id: each.id }));
 
-        // Commands waiting on an outcome or on their effects, at most a push's worth: their receipts come back with
-        // the rows they name. When more wait, each pull names the next ones round, so every one is asked about in
-        // turn (a parked command has no other way to settle).
-        const waiting = current.commands
-          .filter(
-            (each) =>
-              each.state.kind === "sending" ||
-              each.state.kind === "unknown" ||
-              (each.state.kind === "done" && !settled(current, each))
-          )
-          .map((each) => ({ client: each.client, id: each.id }));
+      const turn = waiting.length > pushMax ? current.asking % waiting.length : 0;
+      const commands = [...waiting.slice(turn), ...waiting.slice(0, turn)].slice(0, pushMax);
 
-        const turn = waiting.length > pushMax ? current.asking % waiting.length : 0;
-        const commands = [...waiting.slice(turn), ...waiting.slice(0, turn)].slice(0, pushMax);
-
-        out.push({
-          kind: "pull",
-          client: next.client,
-          dataset: next.replica.dataset,
-          since,
-          verify: verifying,
-          ...(whole ? {} : { page: history.kind === "partial" && since > 0 ? history.next : null }),
-          commands,
-        });
-        next = {
-          ...next,
-          asking: waiting.length > pushMax ? turn + pushMax : 0,
-          pull: { kind: "pulling", since, failures },
-          verify:
-            verifying && next.verify.kind === "pending"
-              ? { kind: "requested", tries: next.verify.tries }
-              : next.verify,
-        };
-      }
+      out.push({
+        kind: "pull",
+        client: next.client,
+        dataset: next.replica.dataset,
+        since,
+        verify: verifying,
+        ...(whole ? {} : { page: history.kind === "partial" && since > 0 ? history.next : null }),
+        commands,
+      });
+      next = {
+        ...next,
+        asking: waiting.length > pushMax ? turn + pushMax : 0,
+        pull: { kind: "pulling", since, failures },
+        verify:
+          verifying && next.verify.kind === "pending"
+            ? { kind: "requested", tries: next.verify.tries }
+            : next.verify,
+      };
     }
 
-    if (next.push.kind === "idle" && now >= next.push.nextAt && reachable(next.connection)) {
+    if (next.push.kind === "idle" && pushStarts(next, now, next.connection)) {
       const tapped = (each: Pending<C, O>) => each.since ?? next.replica.revision;
       let first = next.commands.find(sendable);
 

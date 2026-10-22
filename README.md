@@ -26,6 +26,7 @@ import { call, endpoint } from "slopkit/contract";
 import { replay, unreachable, type Update } from "slopkit/machine";
 import { object, string } from "slopkit/schema";
 import { MEANINGS, states } from "slopkit/states";
+import { underWay } from "slopkit/sync";
 import { route, serveWeb } from "slopkit/server/web";
 
 // one contract, checked on both ends
@@ -64,6 +65,10 @@ const view = ui.subject<Note>("note", {
   saved: { meaning: "ok", where: "main", claim: false, why: "kept", text: () => "saved", action: null },
   unsure: { meaning: "you", where: "main", claim: true, why: "may have saved", text: () => "saved?", action: "check" },
 });
+
+// what the engine runs is `underWay` (slopkit/sync), the rule the check holds working lines to: a command queued
+// offline or in backoff waits, it doesn't send, so place it apart from one going out
+const sending = underWay(sync, { command: { client, id } }, now); // working only while true
 
 // tests replay messages through update
 const { model, effects } = replay(update, { kind: "draft" }, [
