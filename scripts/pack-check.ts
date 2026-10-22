@@ -109,6 +109,7 @@ try {
       dependencies: { slopkit: `file:${tarball}` },
       devDependencies: {
         "@types/node": devVersion("@types/node"),
+        esbuild: devVersion("esbuild"),
         "fake-indexeddb": devVersion("fake-indexeddb"),
         "happy-dom": devVersion("happy-dom"),
         typescript: devVersion("typescript"),

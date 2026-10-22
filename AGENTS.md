@@ -66,7 +66,8 @@ or the kit's own tests in `test/`.
 
 ## Layout
 
-- `src/*.ts`: pure entries. `src/web/`: browser. `src/server/`: Node. `src/test/`: the seeded network, the OIDC
+- `src/*.ts`: pure entries. `src/web/`: browser. `src/server/`: Node. `src/build/`: the page's build (Node, esbuild
+  plugins). `src/test/`: the seeded network, the OIDC
   stand-in and state table checks, for apps' tests. `src/conformance/`: the conformance suite, shipped so each app
   runs it against the version it installs, with `pull.ts` (the server pull contract, run by each app on its own pull)
   and `legacy/` (released adapters, for cross-release checks).

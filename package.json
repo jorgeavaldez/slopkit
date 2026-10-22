@@ -66,6 +66,10 @@
       "types": "./dist/cron.d.ts",
       "default": "./dist/cron.js"
     },
+    "./build/reasons": {
+      "types": "./dist/build/reasons.d.ts",
+      "default": "./dist/build/reasons.js"
+    },
     "./lint": {
       "types": "./dist/lint.d.ts",
       "default": "./dist/lint.js"
@@ -192,11 +196,15 @@
     "vitest": "4.1.11"
   },
   "peerDependencies": {
+    "esbuild": ">=0.25",
     "fake-indexeddb": "^6.2.6",
     "happy-dom": "^21.0.4",
     "vitest": "^4.1.11"
   },
   "peerDependenciesMeta": {
+    "esbuild": {
+      "optional": true
+    },
     "fake-indexeddb": {
       "optional": true
     },

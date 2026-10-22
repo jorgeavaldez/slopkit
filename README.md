@@ -269,6 +269,21 @@ import { preset } from "slopkit/lint";
 export default defineConfig({ extends: [core, vitest, antiSlop, preset] });
 ```
 
+the page's bundle: a state's `why` is for whoever reads the table, never drawn, so the build drops the words (about
+2 KB gzip on an app with 80 states); the page draws from its one model through `slopkit/machine` and the runtime's
+`subscribe`, with preact alone (signals would add 2.6 KB gzip and nothing the model doesn't hold):
+
+```ts
+import { build } from "esbuild";
+import { dropReasons } from "slopkit/build/reasons";
+
+await build({ entryPoints: ["src/web/main.tsx"], bundle: true, minify: true, plugins: [dropReasons()] });
+
+// src/web/main.tsx
+const page = machine({ model: initial(runtime.model()), update, run, render: (model) => render(<App view={show(model)} send={send} />, root) });
+runtime.subscribe((copy) => page.dispatch({ kind: "copy", copy }));
+```
+
 ## why
 
 clankers are bad at error states. i write software on my phone, with no browser to test in, and i don't want to wait
