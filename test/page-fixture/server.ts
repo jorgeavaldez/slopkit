@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { SQLOutputValue } from "node:sqlite";
 
+import { string } from "../../src/schema.ts";
 import type { WebConfig } from "../../src/server/config.ts";
 import type { Logger } from "../../src/server/log.ts";
 import { serveSync, syncHandlers } from "../../src/server/sync.ts";
@@ -18,7 +19,7 @@ export async function startServer({ home, web, now, log }: ServerInput) {
 
   const jobs = store.createJobs<string>({
     encode: JSON.stringify,
-    decode: (text) => JSON.parse(text),
+    decode: (text) => string().parse(JSON.parse(text)),
   });
 
   const received: {
@@ -141,9 +142,14 @@ export async function startServer({ home, web, now, log }: ServerInput) {
     serverTimers,
     web,
     now,
-    serverTimeout: (ms: number) => setTimeout(() => serverTimers.push(`timeout:${Date.now()}`), ms),
+    serverTimeout: (ms: number) =>
+      setTimeout(() => {
+        serverTimers.push(`timeout:${Date.now()}`);
+      }, ms),
     serverInterval: (ms: number) =>
-      setInterval(() => serverTimers.push(`interval:${Date.now()}`), ms),
+      setInterval(() => {
+        serverTimers.push(`interval:${Date.now()}`);
+      }, ms),
     ask: (key: string, dueAt: number) =>
       jobs.ask("check", key, { dueAt, deadlineAt: dueAt + 1000 }),
   };

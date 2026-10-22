@@ -50,7 +50,9 @@ function line(text: string, owed: Owed | null = null, subject = "parcel:P1") {
     .line({ kind: "checking" });
 }
 
-function check<Shown>(shown: Shown, w?: World): string[] {
+type Shown = Parameters<typeof viewProblems>[0];
+
+function check(shown: Shown, w?: World): string[] {
   return viewProblems(shown, { order: MEANINGS, ...(w === undefined ? {} : { world: w }) });
 }
 
