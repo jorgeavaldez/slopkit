@@ -6,7 +6,7 @@ import type { Update } from "../machine.ts";
  */
 import { isLine, isScreen } from "../states.ts";
 import type { Line, Meaning, Owed, Screen, Subject } from "../states.ts";
-import { underWay } from "../sync.ts";
+import { pullUnderWay, SOCKET_DEADLINE_MS, underWay } from "../sync.ts";
 import type { Model } from "../sync.ts";
 
 /** At least one sample state of every kind, for the tests and the gallery. */
@@ -169,6 +169,8 @@ export type World = {
     key: string;
     state: "due" | "running" | "done" | "failed";
     dueAt: string;
+    /** When it last changed (`Job.updatedAt`): a finished job's end, which the page hears of only after a poke. */
+    updatedAt?: string;
   }[];
   /** The page's sync model: its commands and its copy. */
   // oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
@@ -228,14 +230,41 @@ function owedName(owed: Owed): string {
   return "command" in owed ? `command ${owed.command.client}:${owed.command.id}` : "sync";
 }
 
-/** A job running or due by now; the page's sync work as the engine runs it (`slopkit/sync`'s `underWay`). */
+/**
+ * A finished job the page can't have heard of yet: it ended within the socket's deadline (the poke may be on its way,
+ * or the socket goes stale and the page polls), and the page's copy may be from before its end: no copy, one last
+ * caught up before the job ended, or a pull under way.
+ */
+function unheard(job: { updatedAt?: string }, world: World): boolean {
+  const end = job.updatedAt === undefined ? Number.NaN : Date.parse(job.updatedAt);
+
+  if (!(world.now - end < SOCKET_DEADLINE_MS)) {
+    return false;
+  }
+
+  const { model } = world;
+
+  return (
+    model === undefined ||
+    model.reconciledAt === null ||
+    model.reconciledAt < end ||
+    pullUnderWay(model, world.now)
+  );
+}
+
+/**
+ * A job running or due by now, or just finished and not yet heard of (`unheard`); the page's sync work as the engine
+ * runs it (`slopkit/sync`'s `underWay`).
+ */
 function owedUnderWay(owed: Owed, world: World): boolean {
   if ("job" in owed) {
     return (world.jobs ?? []).some(
       (job) =>
         job.kind === owed.job.kind &&
         job.key === owed.job.key &&
-        (job.state === "running" || (job.state === "due" && Date.parse(job.dueAt) <= world.now))
+        (job.state === "running" ||
+          (job.state === "due" && Date.parse(job.dueAt) <= world.now) ||
+          ((job.state === "done" || job.state === "failed") && unheard(job, world)))
     );
   }
 
@@ -244,10 +273,11 @@ function owedUnderWay(owed: Owed, world: World): boolean {
 
 /**
  * A reached view's problems by the kit's rules: every line has text with no broken value; every screen keeps its parts
- * (`screenProblems`); and, given what is under way (`world`), every working line's owed work is: a job running or due by
- * now, or the page's sync work as the engine runs it (`slopkit/sync`'s `underWay`, the rule an app places its working
- * lines by). Takes any value an app's view
- * returns and finds the kit's lines and screens in it. Run it on every view a test reaches, not only on samples.
+ * (`screenProblems`); and, given what is under way (`world`), every working line's owed work is: a job running or due
+ * by now, or just finished before the page could have heard (`World.jobs`' `updatedAt`), or the page's sync work as
+ * the engine runs it (`slopkit/sync`'s `underWay`, the rule an app places its working lines by). Takes any value an
+ * app's view returns and finds the kit's lines and screens in it. Run it on every view a test reaches, not only on
+ * samples.
  */
 export function viewProblems(
   // oxlint-disable-next-line anti-slop/no-unknown-parameters -- an app's view is any shape; only the kit's classes are read

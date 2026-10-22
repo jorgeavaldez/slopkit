@@ -6,6 +6,7 @@ import { expect, test } from "vitest";
 
 import { MEANINGS, states } from "../src/states.ts";
 import type { Line, Owed } from "../src/states.ts";
+import { SOCKET_DEADLINE_MS } from "../src/sync.ts";
 import type { Model, Pending } from "../src/sync.ts";
 import { viewProblems } from "../src/test/states.ts";
 import type { World } from "../src/test/states.ts";
@@ -191,6 +192,42 @@ test.each([
   ];
 
   expect(check(line("checking…", jobDebt), { now, jobs })).toStrictEqual(real ? [] : [badJob]);
+});
+
+// The poke delay: the server finished the job, and the page can't have heard yet.
+const ended = (state: "done" | "failed", ago: number): NonNullable<World["jobs"]> => [
+  {
+    kind: "check",
+    key: "P1",
+    state,
+    dueAt: new Date(now - 60_000).toISOString(),
+    updatedAt: new Date(now - ago).toISOString(),
+  },
+];
+
+test.each(["done", "failed"] as const)(
+  "a job %s within the socket's deadline is still under way until the page could have heard",
+  (state) => {
+    expect(check(line("checking…", jobDebt), { now, jobs: ended(state, 1000) })).toStrictEqual([]);
+    expect(
+      check(line("checking…", jobDebt), { now, jobs: ended(state, SOCKET_DEADLINE_MS - 1) })
+    ).toStrictEqual([]);
+    expect(
+      check(line("checking…", jobDebt), { now, jobs: ended(state, SOCKET_DEADLINE_MS) })
+    ).toStrictEqual([badJob]);
+  }
+);
+
+test("a job that ended before the page's copy last caught up isn't under way, unless a pull is", () => {
+  const caughtUp: M = { ...quiet(), reconciledAt: now - 500 };
+  const jobs = ended("done", 1000);
+  expect(check(line("checking…", jobDebt), { now, jobs, model: caughtUp })).toStrictEqual([badJob]);
+
+  const before: M = { ...quiet(), reconciledAt: now - 2000 };
+  expect(check(line("checking…", jobDebt), { now, jobs, model: before })).toStrictEqual([]);
+
+  const pulling: M = { ...caughtUp, pull: { kind: "pulling", since: 5, failures: 0 } };
+  expect(check(line("checking…", jobDebt), { now, jobs, model: pulling })).toStrictEqual([]);
 });
 
 test("missing jobs and different kind/key never satisfy the debt", () => {
