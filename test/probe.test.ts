@@ -2,7 +2,7 @@ import { once } from "node:events";
 import { existsSync, watch } from "node:fs";
 import { cp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 
 import { afterAll, afterEach, beforeAll, expect, test } from "vitest";
 
@@ -63,11 +63,15 @@ async function app() {
   await writeFile(join(home, "web.json"), JSON.stringify(webSettings()));
   const env = { ...template.env, NOTEBOOK_HOME: home };
 
+  const command = (args: string[], extra: NodeJS.ProcessEnv = {}) =>
+    launch(bin, args, { ...env, ...extra });
+
   return {
     home,
     root,
-    run: (args: string[]) => launch(bin, args, env).finished,
-    start: () => launch(bin, ["serve"], env),
+    command,
+    run: (args: string[]) => command(args).finished,
+    start: () => command(["serve"]),
   };
 }
 
@@ -88,7 +92,7 @@ async function start(h: App) {
   return { child, url };
 }
 
-async function door(status = 302, location = LOGIN) {
+async function door(status = 302, location = LOGIN, body = "door") {
   const requests: { method: string; path: string; cookie?: string; authorization?: string }[] = [];
 
   const server = createServer((request, response) => {
@@ -100,8 +104,11 @@ async function door(status = 302, location = LOGIN) {
         ? {}
         : { authorization: request.headers.authorization }),
     });
-    response.writeHead(request.url === "/" ? status : 200, { location });
-    response.end("door");
+    response.writeHead(request.url === "/" ? status : 200, {
+      location,
+      "content-type": "application/json",
+    });
+    response.end(body);
   });
 
   server.listen(0, "127.0.0.1");
@@ -164,8 +171,13 @@ async function servingRecord(home: string) {
   }
 }
 
-async function homeContents(home: string) {
-  const entries = await readdir(home, { recursive: true, withFileTypes: true });
+async function homeContents(home: string, serverLogs = false) {
+  const found = await readdir(home, { recursive: true, withFileTypes: true });
+
+  const entries = found.filter(
+    (entry) =>
+      !serverLogs || relative(home, join(entry.parentPath, entry.name)).split(sep)[0] !== "logs"
+  );
 
   const files = entries
     .filter((entry) => entry.isFile())
@@ -182,13 +194,13 @@ async function homeContents(home: string) {
 }
 
 test.each([302, 303])(
-  "a live home with a matching %s door reports five ordered successes without changing the home",
+  "a live home with a matching %s door reports five ordered successes without writing to the home",
   async (status) => {
     const h = await app();
     const live = await start(h);
     const d = await door(status);
     await servingRecord(h.home);
-    const before = await homeContents(h.home);
+    const before = await homeContents(h.home, true);
     const result = await h.run(["probe", "--expect", VERSION_ONE, "--door", d.url]);
     expect(result.code).toBe(0);
     expect(lines(result)).toHaveLength(5);
@@ -197,7 +209,7 @@ test.each([302, 303])(
       expect(lines(result)[index]).toMatch(new RegExp(`^ok ${check}: .+`));
     }
 
-    expect(await homeContents(h.home)).toStrictEqual(before);
+    expect(await homeContents(h.home, true)).toStrictEqual(before);
     expect(await servingRecord(h.home)).toMatchObject({
       version: VERSION_ONE,
       pid: live.child.child.pid,
@@ -229,7 +241,7 @@ test.each([302, 303])(
   }
 );
 
-test("serve publishes its record only after ready and removes it on a clean stop", async () => {
+test("serve publishes its record before ready and removes it on a clean stop", async () => {
   const h = await app();
   await writeFile(join(h.home, "config.json"), JSON.stringify({ manualReady: true }));
   const child = h.start();
@@ -246,7 +258,9 @@ test("serve publishes its record only after ready and removes it on a clean stop
 
   await fetch(new URL("/gate", url), { method: "POST" });
   await child.line(/^notebook ready · /);
-  expect(await servingRecord(h.home)).toMatchObject({
+  expect(
+    serving.parse(JSON.parse(await readFile(join(h.home, "serving.json"), "utf-8")))
+  ).toMatchObject({
     version: VERSION_ONE,
     pid: child.child.pid,
     url,
@@ -451,7 +465,7 @@ test.each([
 ])("a door answering with $label fails door", async ({ status, location, reason }) => {
   const h = await app();
   await start(h);
-  const d = await door(status, location);
+  const d = await door(status, location, JSON.stringify({ kind: "signed-out" }));
   expect(await h.run(["probe", "--door", d.url])).toMatchObject(failure("door", reason));
   expect(d.requests).toStrictEqual([{ method: "GET", path: "/" }]);
 });
@@ -495,7 +509,7 @@ test.each([
       })
     );
     await start(h);
-    const d = await door(status, location);
+    const d = await door(status, location, JSON.stringify({ kind: "signed-out" }));
     const result = await h.run(["probe", "--door", d.url]);
     expect(result.code).toBe(0);
     expect(lines(result)).toHaveLength(5);
@@ -524,7 +538,7 @@ test("a web home without a public host skips the door", async () => {
 
 test("a plain-http public host supplies its port to both the local check and default door", async () => {
   const h = await app();
-  const d = await door(401);
+  const d = await door(401, "", JSON.stringify({ kind: "signed-out" }));
   const port = Number(new URL(d.url).port);
   await writeFile(
     join(h.home, "web.json"),
@@ -546,6 +560,217 @@ test("a plain-http public host supplies its port to both the local check and def
   );
 
   expect(requests).toStrictEqual([{ host: new URL(live.url).host }, { host: `127.0.0.1:${port}` }]);
+});
+
+test("a plain-http port of zero uses the listening port for its public Host and default door", async () => {
+  const h = await app();
+  await writeFile(
+    join(h.home, "web.json"),
+    JSON.stringify({
+      port: 0,
+      host: "http://127.0.0.1",
+      oidc: { issuer: "https://identity.example.test", clientId: "fixture" },
+      allow: ["sub:owner"],
+    })
+  );
+  await writeFile(join(h.home, "config.json"), JSON.stringify({ doorRefused: true }));
+  const live = await start(h);
+  const result = await h.run(["probe"]);
+  expect(result.code).toBe(0);
+  expect(lines(result)).toHaveLength(5);
+  expect(lines(result)[4]).toMatch(/^ok door: /);
+  const host = new URL(live.url).host;
+
+  const requests = array(object({ host: string() })).parse(
+    await (await fetch(new URL("/requests", live.url))).json()
+  );
+
+  expect(requests).toStrictEqual([{ host }, { host }]);
+});
+
+test.each([
+  { bind: "127.0.0.2", address: "127.0.0.2", reported: "127.0.0.1" },
+  { bind: "0.0.0.0", address: "127.0.0.1", reported: "127.0.0.2" },
+  { bind: "::1", address: "::1", reported: "127.0.0.1" },
+  { bind: "::", address: "::1", reported: "127.0.0.1" },
+])(
+  "refused connects to $address for bind $bind, keeping the recorded Host",
+  async ({ bind, address, reported }) => {
+    const h = await app();
+    await writeFile(join(h.home, "web.json"), JSON.stringify({ ...webSettings(), bind }));
+    await writeFile(join(h.home, "config.json"), JSON.stringify({ urlHost: reported }));
+    const live = await start(h);
+    const d = await door();
+    const result = await h.run(["probe", "--door", d.url]);
+    expect(result.code).toBe(0);
+    expect(lines(result)[3]).toMatch(/^ok refused: /);
+    const control = new URL(live.url);
+    control.hostname = address.includes(":") ? `[${address}]` : address;
+    control.pathname = "/requests";
+
+    const requests = array(object({ host: string(), address: string() })).parse(
+      await (await fetch(control)).json()
+    );
+
+    expect(requests).toStrictEqual([
+      { host: new URL(live.url).host, address },
+      { host: HOST, address },
+    ]);
+  }
+);
+
+test.each([
+  { field: "apiBody", label: "bare 401", body: "Unauthorized" },
+  { field: "publicApiBody", label: "bare 401", body: "Unauthorized" },
+  { field: "apiBody", label: "another refusal", body: JSON.stringify({ kind: "basic-auth" }) },
+  {
+    field: "publicApiBody",
+    label: "another refusal",
+    body: JSON.stringify({ kind: "basic-auth" }),
+  },
+])("a $label from $field fails refused even with status 401", async ({ field, body }) => {
+  const h = await app();
+  await writeFile(join(h.home, "config.json"), JSON.stringify({ [field]: body }));
+  await start(h);
+  const d = await door();
+  expect(await h.run(["probe", "--door", d.url])).toMatchObject(failure("refused"));
+});
+
+test.each([
+  { label: "bare 401", body: "Unauthorized" },
+  { label: "another refusal", body: JSON.stringify({ kind: "basic-auth" }) },
+])("without access verification a door's $label fails door", async ({ body }) => {
+  const h = await app();
+  await writeFile(
+    join(h.home, "web.json"),
+    JSON.stringify({
+      port: 0,
+      host: HOST,
+      oidc: { issuer: "https://identity.example.test", clientId: "fixture" },
+      allow: ["sub:owner"],
+    })
+  );
+  await start(h);
+  const d = await door(401, "", body);
+  expect(await h.run(["probe", "--door", d.url])).toMatchObject(failure("door"));
+});
+
+test("removing web.json under a live web server fails login", async () => {
+  const h = await app();
+  await start(h);
+  expect((await servingRecord(h.home)).url).toBeDefined();
+  await rm(join(h.home, "web.json"));
+  const d = await door();
+  const result = await h.run(["probe", "--door", d.url]);
+  expect(result).toMatchObject(failure("login", /web\.json.*gone/i));
+  expect(result.out).not.toContain("ok login: no web");
+});
+
+test("the next serve removes a killed run's record before its own app is ready", async () => {
+  const h = await app();
+  const first = await start(h);
+  const record = await servingRecord(h.home);
+  await first.child.stop("SIGKILL");
+  expect(JSON.parse(await readFile(join(h.home, "serving.json"), "utf-8"))).toStrictEqual(record);
+  await writeFile(join(h.home, "config.json"), JSON.stringify({ manualReady: true }));
+  const child = h.start();
+  closes.push(async () => {
+    await child.stop();
+  });
+  const waiting = await child.line(/^fixture waiting · /);
+  const url = waiting.split(" · ")[1];
+
+  if (url === undefined || url === "") {
+    throw new Error("missing waiting URL");
+  }
+
+  try {
+    expect(existsSync(join(h.home, "serving.json"))).toBe(false);
+    expect(await h.run(["probe"])).toMatchObject(failure("serving"));
+  } finally {
+    await fetch(new URL("/gate", url), { method: "POST" });
+    await child.line(/^notebook ready · /);
+  }
+
+  expect(
+    serving.parse(JSON.parse(await readFile(join(h.home, "serving.json"), "utf-8")))
+  ).toMatchObject({
+    pid: child.child.pid,
+    version: VERSION_ONE,
+  });
+});
+
+test("a server starts every time while two probes repeatedly check the home's lock", async () => {
+  const h = await app();
+  await rm(join(h.home, "web.json"));
+  await writeFile(join(h.home, "config.json"), JSON.stringify({ withoutUrl: true }));
+  const warm = h.start();
+  closes.push(async () => {
+    await warm.stop();
+  });
+  await warm.line(/^notebook ready$/);
+  expect((await warm.stop()).code).toBe(0);
+
+  const probes = [
+    h.command(["probe"], { NOTEBOOK_PROBE_LOOP: "1" }),
+    h.command(["probe"], { NOTEBOOK_PROBE_LOOP: "1" }),
+  ];
+
+  for (const probe of probes) {
+    closes.push(async () => {
+      await probe.stop();
+    });
+  }
+
+  await Promise.all(probes.map((probe) => probe.line(/^fixture probing$/)));
+
+  try {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      for (const probe of probes) {
+        expect(probe.child.exitCode).toBeNull();
+      }
+
+      const child = h.start();
+      closes.push(async () => {
+        await child.stop();
+      });
+      await child.line(/^notebook ready$/);
+      expect((await child.stop()).code).toBe(0);
+    }
+  } finally {
+    await Promise.all(probes.map((probe) => probe.stop()));
+  }
+
+  for (const probe of probes) {
+    const checks = probe
+      .output()
+      .split("\n")
+      .filter((line) => /^(ok|fail) serving: /.test(line));
+
+    expect(checks.length).toBeGreaterThan(1);
+  }
+});
+
+test("probe writes nothing while the server logs its refused requests", async () => {
+  const h = await app();
+  await writeFile(join(h.home, "config.json"), JSON.stringify({ logRequests: true }));
+  const live = await start(h);
+  await servingRecord(h.home);
+  const before = await homeContents(h.home, true);
+  const d = await door();
+  const result = await h.run(["probe", "--door", d.url]);
+  expect(result.code).toBe(0);
+  expect(await homeContents(h.home, true)).toStrictEqual(before);
+  await live.child.stop();
+  const logs = await readdir(join(h.home, "logs"));
+
+  const text = await Promise.all(
+    logs
+      .filter((name) => name.endsWith(".jsonl"))
+      .map((name) => readFile(join(h.home, "logs", name), "utf-8"))
+  );
+
+  expect(text.join("\n")).toContain("fixture request refused");
 });
 
 test.each([

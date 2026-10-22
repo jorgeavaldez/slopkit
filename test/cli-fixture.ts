@@ -163,20 +163,27 @@ const options = {
     const apiRequests = [];
     const server = createServer((request, response) => {
       if (request.url === '/requests') { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(apiRequests)); return; }
+      if (request.url === '/' && config.doorRefused) { response.writeHead(401, { 'content-type': 'application/json' }); response.end(JSON.stringify({ kind: 'signed-out' })); return; }
       if (request.url === '/api/') {
         const host = request.headers.host;
-        apiRequests.push({ path: request.url, method: request.method, host, accept: request.headers.accept, cookie: request.headers.cookie, authorization: request.headers.authorization });
-        const publicHost = web.host ? web.host.name + (web.host.https ? '' : ':' + web.port) : undefined;
-        const localHost = '127.0.0.1:' + server.address().port;
+        apiRequests.push({ path: request.url, method: request.method, host, address: request.socket.localAddress, accept: request.headers.accept, cookie: request.headers.cookie, authorization: request.headers.authorization });
+        const publicHost = web.host ? web.host.name + (web.host.https ? '' : ':' + (web.port === 0 ? server.address().port : web.port)) : undefined;
+        const localHost = new URL(url).host;
         response.statusCode = host !== localHost && host !== publicHost ? 421 : host === publicHost ? (config.publicApiStatus ?? 401) : (config.apiStatus ?? 401);
         if (response.statusCode === 302) { response.setHeader('location', '/unexpected'); }
-        response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ kind: 'unauthenticated' })); return;
+        if (config.logRequests) { say('info', 'fixture request refused', { host }); }
+        const body = host === publicHost ? (config.publicApiBody ?? config.apiBody) : config.apiBody;
+        response.setHeader('content-type', 'application/json'); response.end(body ?? JSON.stringify({ kind: 'signed-out' })); return;
       }
       if (request.url === '/gate') { response.end('released'); releaseReady(); return; }
       if (request.url === '/update') { const asked = askUpdate(jobs, config.release || 'edge', version, { client: 'fixture_page', id: 1 }); response.on('finish', () => update()); response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(asked)); return; }
       response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ version, rows, pid: process.pid }));
     });
-    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); const address = server.address(); const url = 'http://127.0.0.1:' + address.port;
+    const bind = web.bind ?? '127.0.0.1';
+    await new Promise(resolve => server.listen(0, bind, resolve)); const address = server.address();
+    const local = bind === '0.0.0.0' ? '127.0.0.1' : bind === '::' ? '::1' : bind;
+    const urlHost = config.urlHost ?? local;
+    const url = 'http://' + (urlHost.includes(':') ? '[' + urlHost + ']' : urlHost) + ':' + address.port;
     if (config.manualReady) { console.log('fixture waiting · ' + url); await gate; }
     if (${JSON.stringify(behavior)} === 'degraded') { console.log('notebook degraded: web off: fixture cannot serve'); }
     say('info', 'fixture started', { version }); console.log('fixture serving ' + version + ' · ' + url + ' · ' + process.pid);
@@ -186,7 +193,14 @@ const options = {
     };
   },
 };
-process.exitCode = await runCli(process.argv.slice(2), options);
+const args = process.argv.slice(2);
+if (process.env.NOTEBOOK_PROBE_LOOP === '1' && args[0] === 'probe') {
+  let active = true; process.once('SIGTERM', () => { active = false; });
+  console.log('fixture probing');
+  while (active) { await runCli(args, options); await new Promise(resolve => setImmediate(resolve)); }
+} else {
+  process.exitCode = await runCli(args, options);
+}
 `;
 }
 
