@@ -251,12 +251,15 @@ function decodeCookie(value: string | undefined): string | undefined {
   }
 }
 
-/** A path on this server to return to, or nothing: never another origin (`//host`, `/\\host`, a scheme). */
+/**
+ * A path on this server to return to, or nothing: never another origin (`//host`, `/\\host`, a scheme), and only
+ * printable ASCII, which a Location header always takes (the redirect to the login percent-encodes the rest).
+ */
 function onThisServer(path: string | null | undefined): string | undefined {
   return path !== null &&
     path !== undefined &&
     path.length <= 2048 &&
-    /^\/(?![/\\])[^\s\\]*$/.test(path)
+    /^\/(?![/\\])[\u0021-\u005B\u005D-\u007E]*$/.test(path)
     ? path
     : undefined;
 }

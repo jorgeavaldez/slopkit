@@ -103,7 +103,15 @@ test("sign-in returns to the page it interrupted, never off this server", async 
     expect(page.status).toBe(302);
     expect(await signIn(page)).toBe("/c/abc123?item=a.png");
 
-    for (const elsewhere of ["//evil.example/x", "/\\evil.example", "https://evil.example/"]) {
+    // Off this server, or a character a Location header refuses: the sign-in still lands, at the root.
+    for (const elsewhere of [
+      "//evil.example/x",
+      "/\\evil.example",
+      "https://evil.example/",
+      "/\u0001x",
+      "/\u007F",
+      "/caf\u00E9",
+    ]) {
       const forged = new Response(null, {
         status: 302,
         headers: { location: `/auth/login?back=${encodeURIComponent(elsewhere)}` },
