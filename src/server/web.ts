@@ -117,25 +117,28 @@ export function route<Req, Res>(
   };
 }
 
-/** What a raw route's handler gets: the URL, what a `/*` path matched past its prefix, the bounded body, the headers. */
+/**
+ * What a raw route's handler gets: the URL, what a `/*` path matched past its prefix (`{ "*": rest }`, decoded once;
+ * `{}` for an exact path), the bounded body, the headers.
+ */
 export type RawRequest = {
   url: URL;
-  params: { "*": string };
+  params: Record<string, string>;
   body: Buffer | undefined;
   headers: IncomingMessage["headers"];
 };
 
 /**
  * What a raw route answers. `cache`: `immutable` for content named by its hash (kept for a year, by this browser only),
- * else `no-store`. `sandbox`: the bytes are served in a sandbox (an image or a file someone else made). The security
- * headers are always the server's: `headers` can add others (`etag`, `content-disposition`), never replace those.
+ * else `no-store`. The security headers are always the server's: `headers` can add others (`etag`,
+ * `content-disposition`), never replace those, except a `content-security-policy` that keeps every directive of the
+ * server's as it is and only adds ones that tighten it (`sandbox` for bytes someone else made).
  */
 export type RawReply = {
   status: number;
   type: string;
   body: Buffer | string;
   cache?: "immutable" | "no-store";
-  sandbox?: boolean;
   headers?: Record<string, string>;
 };
 
@@ -171,8 +174,47 @@ export function rawRoute(definition: {
   };
 }
 
-/** Types already compressed: gzipping them again only costs time. */
-const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|manifest\+json)|image\/svg\+xml)/;
+/** Types worth gzipping; images never are, whatever their format. */
+const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|manifest\+json))/i;
+
+/** CSP directives that only take away: a handler may add these to the server's policy. */
+const TIGHTENING = new Set([
+  "sandbox",
+  "upgrade-insecure-requests",
+  "block-all-mixed-content",
+  "require-trusted-types-for",
+  "trusted-types",
+]);
+
+function directives(policy: string): Map<string, string> {
+  return new Map(
+    policy
+      .split(";")
+      .map((part) => part.trim().replaceAll(/\s+/g, " "))
+      .filter((part) => part !== "")
+      .map((part) => {
+        const space = part.indexOf(" ");
+
+        return space === -1
+          ? [part.toLowerCase(), ""]
+          : [part.slice(0, space).toLowerCase(), part.slice(space + 1)];
+      })
+  );
+}
+
+/** A handler's policy when it keeps every directive of `base` unchanged and adds only tightening ones; else `base`. */
+function tightened(base: string, offered: string | undefined): string {
+  if (offered === undefined) {
+    return base;
+  }
+
+  const want = directives(base);
+  const got = directives(offered);
+  const keeps = [...want].every(([name, value]) => got.get(name) === value);
+  const adds = [...got.keys()].every((name) => want.has(name) || TIGHTENING.has(name));
+
+  return keeps && adds ? offered : base;
+}
 
 export type Socket = {
   path: string;
@@ -327,7 +369,9 @@ export async function serveWeb(
     const prefix = each.path.endsWith("/*") ? each.path.slice(0, -1) : undefined;
 
     const covers = (path: string) =>
-      prefix === undefined ? path === each.path : path.startsWith(prefix);
+      prefix === undefined
+        ? path === each.path
+        : path.startsWith(prefix) || path === prefix.slice(0, -1) || prefix === "/";
 
     if (
       each.path.startsWith("/auth/") ||
@@ -345,17 +389,17 @@ export async function serveWeb(
   }
 
   /** The raw routes for a path, most specific first, with what a `/*` matched. */
-  function rawFor(path: string): { found: RawRoute; params: string }[] {
+  function rawFor(path: string): { found: RawRoute; params: string | undefined }[] {
     // Matched on the decoded path, so a prefix's remainder is decoded exactly once.
     return raws
-      .flatMap((each) => {
+      .flatMap((each): { found: RawRoute; params: string | undefined; rank: number }[] => {
         if (each.path === path) {
-          return [{ found: each, params: "", rank: Number.MAX_SAFE_INTEGER }];
+          return [{ found: each, params: undefined, rank: Number.MAX_SAFE_INTEGER }];
         }
 
         const prefix = each.path.endsWith("/*") ? each.path.slice(0, -1) : undefined;
 
-        return prefix !== undefined && path.startsWith(prefix) && path.length > prefix.length
+        return prefix !== undefined && path.startsWith(prefix)
           ? [{ found: each, params: path.slice(prefix.length), rank: prefix.length }]
           : [];
       })
@@ -416,7 +460,7 @@ export async function serveWeb(
     response: ServerResponse,
     url: URL,
     caller: Caller,
-    candidates: { found: RawRoute; params: string }[]
+    candidates: { found: RawRoute; params: string | undefined }[]
   ): Promise<void> {
     const started = performance.now();
     const method = request.method === "HEAD" ? "GET" : (request.method ?? "GET");
@@ -445,11 +489,20 @@ export async function serveWeb(
       const body = method === "POST" ? await readBytes(request, found.bodyLimit) : undefined;
 
       const reply = await found.handle(
-        { url, params: { "*": params }, body, headers: request.headers },
+        {
+          url,
+          params: params === undefined ? {} : { "*": params },
+          body,
+          headers: request.headers,
+        },
         caller
       );
 
       status = reply.status;
+
+      const offered = Object.entries(reply.headers ?? {}).find(
+        ([name]) => name.toLowerCase() === "content-security-policy"
+      )?.[1];
 
       const own = Object.fromEntries(
         Object.entries(reply.headers ?? {}).filter(
@@ -466,9 +519,7 @@ export async function serveWeb(
         "content-type": reply.type,
         "cache-control":
           reply.cache === "immutable" ? "private, max-age=31536000, immutable" : "no-store",
-        ...(reply.sandbox === true
-          ? { "content-security-policy": `${SECURITY["content-security-policy"]}; sandbox` }
-          : {}),
+        "content-security-policy": tightened(SECURITY["content-security-policy"], offered),
       });
     } catch (error) {
       const kind = error instanceof Refusal ? error.kind : "unavailable";
