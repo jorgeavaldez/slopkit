@@ -50,8 +50,13 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME doesn't match package.json's $version"
             exit 1
           fi
+          # A version with a `-` (0.4.0-rc.0) is a prerelease: never GitHub's latest release.
+          flags=()
+          if [[ "$version" == *-* ]]; then
+            flags=(--prerelease --latest=false)
+          fi
           if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release create "$GITHUB_REF_NAME" slopkit.tgz --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+            gh release create "$GITHUB_REF_NAME" slopkit.tgz --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${flags[@]}"
           fi
 
   # Trusted publishing: npm trusts this workflow, no token. A version is published once.
@@ -89,4 +94,9 @@ jobs:
             echo "::error::couldn't ask the registry about slopkit@$version: $view"
             exit 1
           fi
-          npm publish slopkit.tgz --access public
+          # A prerelease goes under `next`, never `latest`: npm refuses a prerelease without a tag.
+          if [[ "$version" == *-* ]]; then
+            npm publish slopkit.tgz --access public --tag next
+          else
+            npm publish slopkit.tgz --access public
+          fi
