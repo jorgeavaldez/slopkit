@@ -274,6 +274,20 @@ test("adding a table keeps liftable old rows and opens the new table empty", asy
   expect(reopened.commands).toStrictEqual(waiting);
 });
 
+test("adding a table without lifts keeps the existing rows and opens the new table empty", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow, { names: ["rows"] }), copy(oldRows, []));
+  f.close();
+  const loaded = await f.open(olderRow, { version: 2 }).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, oldRows, []);
+  expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 0, server: null });
+  const reopened = await f.open(olderRow, { version: 2 }).port.load();
+  expectRows(reopened.replica, oldRows, []);
+  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 0, server: null });
+  expect(reopened.commands).toStrictEqual(waiting);
+});
+
 test("without lifts a changed row shape starts over and keeps waiting commands at their own revisions", async () => {
   const f = fixture();
   await seed(f.open(olderRow));
