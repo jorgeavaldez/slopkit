@@ -662,7 +662,16 @@ test("contract routes can lower or raise their own byte cap without changing the
     },
     {
       globalLimit: 24,
-      routes: [make("/api/small", 16), make("/api/default"), make("/api/large", 64)],
+      routes: [
+        rawRoute({
+          method: "GET",
+          path: "/bytes",
+          handle: () => ({ status: 200, type: "text/plain", body: "raw alongside contracts" }),
+        }),
+        make("/api/small", 16),
+        make("/api/default"),
+        make("/api/large", 64),
+      ],
     }
   );
 });
