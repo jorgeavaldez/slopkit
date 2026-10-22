@@ -24,6 +24,10 @@ import { rawRoute, route, serveWeb } from "../src/server/web.ts";
 import type { Caller, WebOptions } from "../src/server/web.ts";
 import { identityProvider } from "../src/test/oidc.ts";
 
+/** vitest's matchers are typed `any`; held as `unknown` they nest in expected values safely. */
+const anyString: unknown = expect.any(String);
+const anyNumber: unknown = expect.any(Number);
+
 type RawRequest = {
   url: URL;
   params: Record<string, string>;
@@ -334,7 +338,9 @@ test("a chunked raw upload is bounded by received bytes, not by a missing Conten
             { method: "POST", headers: { authorization: `Bearer ${token}` } },
             (response) => {
               const chunks: Buffer[] = [];
-              response.on("data", (chunk: Buffer) => chunks.push(chunk));
+              response.on("data", (chunk: Buffer) => {
+                chunks.push(chunk);
+              });
               response.once("error", reject);
               response.once("end", () =>
                 resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString() })
@@ -574,23 +580,22 @@ test("raw requests use the normal request log with caller, request id, status an
       )
     ).join("");
 
-    const lines: unknown[] = text
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const lines: unknown = JSON.parse(`[${text.trim().split("\n").join(",")}]`);
+
+    const attributes: unknown = expect.objectContaining({
+      path: "/picture.png",
+      method: "GET",
+      caller: "key:robot",
+      request: anyString,
+      person: false,
+      status: 200,
+      ms: anyNumber,
+    });
 
     expect(lines).toContainEqual(
       expect.objectContaining({
         body: "request",
-        attributes: expect.objectContaining({
-          path: "/picture.png",
-          method: "GET",
-          caller: "key:robot",
-          request: expect.any(String),
-          person: false,
-          status: 200,
-          ms: expect.any(Number),
-        }),
+        attributes,
       })
     );
     expect(text).not.toContain(token);

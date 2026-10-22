@@ -27,6 +27,9 @@ import { route, serveWeb } from "../src/server/web.ts";
 import type { Caller } from "../src/server/web.ts";
 import { identityProvider } from "../src/test/oidc.ts";
 
+/** vitest's matchers are typed `any`; held as `unknown` they nest in expected values safely. */
+const anyString: unknown = expect.any(String);
+
 const callerShape = object({ identities: array(string()), person: boolean(), login: string() });
 const read = endpoint("GET", "/api/read", object({}), callerShape);
 const act = endpoint("POST", "/api/act", object({}), callerShape);
@@ -197,7 +200,7 @@ test("addKey returns a named 32-byte base64url token once and stores only SHA-25
       : Object.values(record(entry).parse(stored));
 
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toStrictEqual({ name: "a", sha256: expect.any(String) });
+    expect(entries[0]).toStrictEqual({ name: "a", sha256: anyString });
     const hash = entries[0]?.sha256 ?? "";
 
     const bytes = /^[0-9a-f]{64}$/i.test(hash)
@@ -277,15 +280,14 @@ test.each([
       expect(calls).toStrictEqual([]);
       const text = await logs(log);
 
-      const lines: unknown[] = text
-        .trim()
-        .split("\n")
-        .map((line) => JSON.parse(line));
+      const lines: unknown = JSON.parse(`[${text.trim().split("\n").join(",")}]`);
+
+      const attributes: unknown = expect.objectContaining({ path: read.path });
 
       expect(lines).toContainEqual(
         expect.objectContaining({
           severity: "warn",
-          attributes: expect.objectContaining({ path: read.path }),
+          attributes,
         })
       );
 
@@ -438,7 +440,9 @@ test("a socket upgrade accepts a verified bearer without Origin and reports the 
 
     try {
       const message = await new Promise<string>((resolve, reject) => {
-        socket.once("message", (data) => resolve(String(data)));
+        socket.once("message", (data) =>
+          resolve(new TextDecoder().decode(Array.isArray(data) ? Buffer.concat(data) : data))
+        );
         socket.once("error", reject);
       });
 
@@ -465,21 +469,20 @@ test("request logs carry caller key:<name>, status and request id, never the tok
     await response.text();
     const text = await logs(log);
 
-    const lines: unknown[] = text
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const lines: unknown = JSON.parse(`[${text.trim().split("\n").join(",")}]`);
+
+    const attributes: unknown = expect.objectContaining({
+      caller: "key:robot",
+      path: read.path,
+      status: 200,
+      person: false,
+      request: anyString,
+    });
 
     expect(lines).toContainEqual(
       expect.objectContaining({
         body: "request",
-        attributes: expect.objectContaining({
-          caller: "key:robot",
-          path: read.path,
-          status: 200,
-          person: false,
-          request: expect.any(String),
-        }),
+        attributes,
       })
     );
     expect(text).not.toContain(token);
