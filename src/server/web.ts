@@ -131,8 +131,8 @@ export type RawRequest = {
 /**
  * What a raw route answers. `cache`: `immutable` for content named by its hash (kept for a year, by this browser only),
  * else `no-store`. The security headers are always the server's: `headers` can add others (`etag`,
- * `content-disposition`), never replace those, except a `content-security-policy` that keeps every directive of the
- * server's as it is and only adds ones that tighten it (`sandbox` for bytes someone else made).
+ * `content-disposition`), never replace those; a `content-security-policy` only adds directives that tighten the
+ * server's (`content-security-policy: sandbox` for bytes someone else made).
  */
 export type RawReply = {
   status: number;
@@ -202,18 +202,22 @@ function directives(policy: string): Map<string, string> {
   );
 }
 
-/** A handler's policy when it keeps every directive of `base` unchanged and adds only tightening ones; else `base`. */
+/**
+ * The server's policy with the tightening directives a handler's policy names added (`sandbox` for bytes someone else
+ * made). Everything else in the handler's policy is ignored: the server's directives are never replaced or dropped.
+ */
 function tightened(base: string, offered: string | undefined): string {
   if (offered === undefined) {
     return base;
   }
 
-  const want = directives(base);
-  const got = directives(offered);
-  const keeps = [...want].every(([name, value]) => got.get(name) === value);
-  const adds = [...got.keys()].every((name) => want.has(name) || TIGHTENING.has(name));
+  const own = directives(base);
 
-  return keeps && adds ? offered : base;
+  const added = [...directives(offered)].flatMap(([name, value]) =>
+    TIGHTENING.has(name) && !own.has(name) ? [value === "" ? name : `${name} ${value}`] : []
+  );
+
+  return [base, ...added].join("; ");
 }
 
 export type Socket = {
@@ -412,7 +416,7 @@ export async function serveWeb(
 
     // Any Authorization is a bearer's claim: one that isn't a well-formed bearer is refused, never ignored.
     const bearer =
-      authorization === undefined ? undefined : (/^Bearer (\S+)$/.exec(authorization)?.[1] ?? "");
+      authorization === undefined ? undefined : (/^Bearer (\S+)$/i.exec(authorization)?.[1] ?? "");
 
     const jwt = header(request, "cf-access-jwt-assertion");
 

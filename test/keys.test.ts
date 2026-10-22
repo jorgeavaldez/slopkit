@@ -488,3 +488,14 @@ test("request logs carry caller key:<name>, status and request id, never the tok
     expect(text).not.toContain(token);
     expect(text).not.toContain(token.split(".")[1]);
   }));
+
+test("the bearer scheme is case-insensitive", () =>
+  withServer(async ({ url, token, calls }) => {
+    const response = await fetch(new URL(read.path, url), {
+      headers: { authorization: `bearer ${token}` },
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toStrictEqual(keyCaller);
+    expect(calls).toHaveLength(1);
+  }));

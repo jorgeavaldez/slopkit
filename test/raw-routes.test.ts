@@ -713,3 +713,32 @@ test("contract routes without an override keep the 64-KiB default", async () => 
     }
   );
 });
+
+test.each([
+  { name: "sandbox alone", policy: "sandbox" },
+  { name: "sandbox beside a narrowed directive", policy: "img-src 'self'; sandbox" },
+  {
+    name: "sandbox beside a loosened directive",
+    policy: "default-src *; script-src * 'unsafe-inline'; sandbox",
+  },
+])(
+  "a handler's $name adds sandbox to the whole baseline, never replacing a directive",
+  ({ policy }) =>
+    withServer(
+      async ({ url, cookie }) => {
+        const response = await fetch(new URL("/picture.png", url), { headers: { cookie } });
+        expect(response.status).toBe(200);
+        await response.arrayBuffer();
+        secure(response);
+        expect(response.headers.get("content-security-policy")).toBe(`${baseline}; sandbox`);
+      },
+      {
+        reply: {
+          status: 200,
+          type: "image/png",
+          body: "bytes",
+          headers: { "content-security-policy": policy },
+        },
+      }
+    )
+);
