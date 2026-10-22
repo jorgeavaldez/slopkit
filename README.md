@@ -230,6 +230,16 @@ runtime.subscribe((model) => draw(model));
 runtime.start();
 ```
 
+a release that changes or adds tables starts the device's copy over unless the replica has `lifts`, which keeps
+unchanged tables, lifts changed ones and opens new ones empty (the lift code ships only to apps that pass it):
+
+```ts
+import { lifting } from "slopkit/web/lift";
+
+const replica = { version: 2, tables, empty, lifts: lifting({ notes: (row) => ({ ...oldNote.parse(row), pinned: false }) }) };
+// lifting({}) keeps the copy across a release that only adds a table
+```
+
 and `main.ts` is the command line: `serve | update | rollback | probe | version`, one server per home, releases that
 boot on a copy of the store before they replace the running one, automatic rollback of a crashing update, and `probe`,
 the live server checked from its host with no identity (it serves, the version that passed, no test login, requests

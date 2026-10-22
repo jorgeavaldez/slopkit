@@ -11,6 +11,7 @@ import { array, boolean, nullable, number, object, string } from "../src/schema.
 import type { Infer, Schema } from "../src/schema.ts";
 import { createSync, table } from "../src/sync.ts";
 import type { Key, Pending, Replica } from "../src/sync.ts";
+import { lifting } from "../src/web/lift.ts";
 import { indexedReplica } from "../src/web/replica.ts";
 import { createRuntime } from "../src/web/runtime.ts";
 import type { RuntimeEnv } from "../src/web/runtime.ts";
@@ -127,7 +128,7 @@ function fixture() {
       empty,
       server: serverSchema,
       pending,
-      ...(options.lifts === undefined ? {} : { lifts: options.lifts }),
+      ...(options.lifts === undefined ? {} : { lifts: lifting(options.lifts) }),
       interfere: (_what: "commit" | "keep" | "drop", transaction: IDBTransaction) => {
         connections.add(transaction.db);
       },
@@ -273,27 +274,38 @@ test("adding a table keeps liftable old rows and opens the new table empty", asy
   expectRows(loaded.replica, oldRows, []);
   expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
   expect(loaded).toMatchObject({ restart: "paged" });
-  const reopened = await f.open(olderRow, { version: 2 }).port.load();
+  const reopened = await f.open(olderRow, { version: 2, lifts: {} }).port.load();
   expectRows(reopened.replica, oldRows, []);
   expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 7 });
   expect(reopened).toMatchObject({ restart: "paged" });
   expect(reopened.commands).toStrictEqual(waiting);
 });
 
-test("adding a table without lifts keeps the existing rows and opens the new table empty", async () => {
+test("adding a table with lifts but none for it keeps the existing rows and opens the new table empty", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow, { names: ["rows"] }), copy(oldRows, []));
+  f.close();
+  const loaded = await f.open(olderRow, { version: 2, lifts: {} }).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, oldRows, []);
+  expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
+  expect(loaded).toMatchObject({ restart: "paged" });
+  const reopened = await f.open(olderRow, { version: 2, lifts: {} }).port.load();
+  expectRows(reopened.replica, oldRows, []);
+  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
+  expect(reopened).toMatchObject({ restart: "paged" });
+  expect(reopened.commands).toStrictEqual(waiting);
+});
+
+test("adding a table without lifts starts the copy over and keeps waiting commands", async () => {
   const f = fixture();
   await seed(f.open(olderRow, { names: ["rows"] }), copy(oldRows, []));
   f.close();
   const loaded = await f.open(olderRow, { version: 2 }).port.load();
   expect(loaded.commands).toStrictEqual(waiting);
-  expectRows(loaded.replica, oldRows, []);
-  expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
-  expect(loaded).toMatchObject({ restart: "paged" });
-  const reopened = await f.open(olderRow, { version: 2 }).port.load();
-  expectRows(reopened.replica, oldRows, []);
-  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
-  expect(reopened).toMatchObject({ restart: "paged" });
-  expect(reopened.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, [], []);
+  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
+  expect(loaded.restart).toBeUndefined();
 });
 
 test("without lifts a changed row shape starts over and keeps waiting commands at their own revisions", async () => {
@@ -455,7 +467,7 @@ function runtimeOptions(f: ReturnType<typeof fixture>, host: string) {
     name: "replica-upgrade",
     sync,
     api,
-    replica: { version: 1, tables, empty, pending, lifts },
+    replica: { version: 1, tables, empty, pending, lifts: lifting(lifts) },
     env,
   };
 }

@@ -17,6 +17,7 @@ import { digest } from "../digest.ts";
 import { check } from "../schema.ts";
 import type { Schema } from "../schema.ts";
 import type { createSync, Lens, Model, Pending } from "../sync.ts";
+import type { Lifting } from "./lift.ts";
 import { indexedReplica } from "./replica.ts";
 
 type Attributes = Record<string, string | number | boolean | null>;
@@ -126,8 +127,8 @@ export function createRuntime<
     /** The outbox's command schema; default the api's. */
     pending?: Schema<Pending<C, O>>;
     legacy?: { store: string; convert: (value: unknown) => Pending<C, O> | undefined };
-    /** By table: an earlier release's row as this one reads it, so an upgrade keeps the offline copy (`web/replica`). */
-    lifts?: Readonly<Record<string, (row: unknown) => unknown>>;
+    /** How an upgrade keeps the offline copy (`lifting` from `slopkit/web/lift`); without it, a changed copy starts over. */
+    lifts?: Lifting;
   };
   /** How long a push may take before it counts as lost (default 30 s). */
   pushTimeoutMs?: number;

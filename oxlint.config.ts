@@ -44,8 +44,8 @@ export default defineConfig({
   overrides: [
     {
       // Where untyped input becomes typed: schemas, config, session and key files, IndexedDB records, SQL rows, replies,
-      // the store's head file, the socket's messages, a release's package, records and output, and the browser globals
-      // the headless page stands in for.
+      // an earlier release's rows, the store's head file, the socket's messages, a release's package, records and
+      // output, and the browser globals the headless page stands in for.
       files: [
         "src/schema.ts",
         "src/client.ts",
@@ -58,6 +58,7 @@ export default defineConfig({
         "src/server/store.ts",
         "src/server/web.ts",
         "src/web/replica.ts",
+        "src/web/lift.ts",
         "src/web/runtime.ts",
         "src/test/page.ts",
         "scripts/pack-check.ts",

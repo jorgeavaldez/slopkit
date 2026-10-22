@@ -20,12 +20,9 @@
  *   cursor the patch moved from, and a complete copy at a revision is never narrowed to a partial one. The server's facts are not rows: facts an older page kept that no longer fit load as null and
  *   never cost the copy; facts that change at the same revision are written too.
  * - An upgrade keeps the outbox and the generation (an intent on disk is never erased; one this version can't read
- *   stays on disk and is counted) and the copy where it can: a table whose row shape is unchanged is kept as it is, one
- *   whose shape changed goes through the app's lift (`lifts`), a table that is new starts empty. The copy is rewritten
- *   under this release's shapes in one transaction, kept only if every table then reads, keeps its dataset and
- *   revision (taps made on it carry it) but no server facts, and is marked lifted: it loads owing a real reset, so the
- *   first contact replaces it whole; offline it shows what it had. A changed table with no lift, a row that still
- *   doesn't read, or a table this release doesn't have starts the copy over.
+ *   stays on disk and is counted). With the app's `lifts` (`slopkit/web/lift`) it keeps the copy where it can,
+ *   rewritten and marked lifted: it loads owing a real reset, so the first contact replaces it whole; offline it shows
+ *   what it had. Without, a copy under other row shapes starts over.
  * - A newer version opening in another tab closes this page's connection; its writes then fail as `Replaced`.
  *
  * `factory` is the browser's `indexedDB`, or any implementation of the same API (the headless simulation passes an
@@ -38,6 +35,7 @@ import type { Schema } from "../schema.ts";
 import { commitPlan, OUTBOX_MAX } from "../sync.ts";
 import type { History, Lens, Op, Pending, Replica } from "../sync.ts";
 import { committed, openDatabase, request } from "./idb.ts";
+import type { Lifting } from "./lift.ts";
 
 /** Which dataset a copy holds, at what revision (0 before any), and how much of its history. */
 type Position = { dataset: string | null; revision: number; history: History };
@@ -101,12 +99,10 @@ export function indexedReplica<T, P, S, C, O>(options: {
    */
   legacy?: { store: string; convert: (value: unknown) => Pending<C, O> | undefined };
   /**
-   * By table: an earlier release's row, as this one reads it (a field it added, given). A table whose row shape
-   * changed needs one, or the copy starts over; a table whose shape didn't is kept as it is. A lift may be handed any
-   * other release's row, a newer one's too (a rollback): it parses the shapes it knows strictly and throws on others,
-   * which starts the copy over.
+   * How an earlier release's copy is kept (`lifting` from `slopkit/web/lift`): without it, a copy under other row
+   * shapes starts over.
    */
-  lifts?: Readonly<Record<string, (row: unknown) => unknown>>;
+  lifts?: Lifting;
 }): StoragePort<T, S, C, O> & { forget: () => Promise<void> } {
   const names = options.tables.map((lens) => lens.name);
   const shapes = options.tables.map((lens) => lens.shape).join("\n");
@@ -305,117 +301,6 @@ export function indexedReplica<T, P, S, C, O>(options: {
     return at;
   };
 
-  type Entry = { key: string | number; row: unknown };
-
-  /**
-   * A copy an earlier release wrote under other row shapes, as this release reads it: each table whose shape changed
-   * through its lift, the others as they are, a table that is new empty. Undefined when any table can't be read.
-   */
-  const lift = (
-    written: string,
-    stored: readonly (readonly Entry[])[]
-  ): { tables: T; partial: boolean } | undefined => {
-    const partial = written.endsWith("\npartial");
-    const before = new Set((partial ? written.slice(0, -"\npartial".length) : written).split("\n"));
-    const prefixes = options.tables.map((lens) => `${JSON.stringify(lens.name)}:`);
-
-    // A table this release doesn't have: a newer release's copy, or a table renamed. Neither is this one's to lift.
-    if ([...before].some((line) => !prefixes.some((prefix) => line.startsWith(prefix)))) {
-      return undefined;
-    }
-
-    let restored: T | undefined = options.empty;
-
-    for (const [index, lens] of options.tables.entries()) {
-      const rows = stored[index] ?? [];
-      const prefix = prefixes[index] ?? "";
-      const each = options.lifts?.[lens.name];
-      let read: readonly Entry[];
-
-      if (before.has(lens.shape)) {
-        read = rows;
-      } else if (![...before].some((line) => line.startsWith(prefix))) {
-        read = [];
-      } else if (each === undefined) {
-        return undefined;
-      } else {
-        try {
-          read = rows.map((entry) => ({ key: entry.key, row: each(entry.row) }));
-        } catch {
-          return undefined;
-        }
-      }
-
-      restored = restored === undefined ? undefined : lens.restore(restored, read);
-    }
-
-    return restored === undefined ? undefined : { tables: restored, partial };
-  };
-
-  /**
-   * Write a lifted copy in place of the one it came from, in one transaction, if the disk still holds that one: its
-   * dataset and revision, marked lifted, under this release's shapes. False when the disk moved on or refused.
-   */
-  const rewrite = async (
-    from: { dataset: string; revision: number; shapes: string },
-    tables: T,
-    history: History
-  ): Promise<boolean> => {
-    const database = await db();
-    const transaction = database.transaction([...names, "meta"], "readwrite");
-    const done = committed(transaction);
-    const meta = transaction.objectStore("meta");
-
-    try {
-      await guard(transaction);
-      const point = await request<unknown>(meta.get("checkpoint"));
-
-      const still =
-        typeof point === "object" &&
-        point !== null &&
-        Reflect.get(point, "dataset") === from.dataset &&
-        Reflect.get(point, "revision") === from.revision &&
-        Reflect.get(point, "shapes") === from.shapes;
-
-      if (!still) {
-        transaction.abort();
-        await done.catch(() => undefined);
-
-        return false;
-      }
-
-      for (const name of names) {
-        transaction.objectStore(name).clear();
-      }
-
-      for (const lens of options.tables) {
-        for (const op of lens.snapshot(tables)) {
-          if (!("drop" in op)) {
-            transaction.objectStore(op.table).put(op.row, op.key);
-          }
-        }
-      }
-
-      const checkpoint: Checkpoint<S> = {
-        dataset: from.dataset,
-        revision: from.revision,
-        server: null,
-        lifted: true,
-        ...(history.kind === "partial" ? { history, shapes: partialShapes } : { shapes }),
-      };
-
-      meta.put(checkpoint, "checkpoint");
-      options.interfere?.("commit", transaction);
-      await done;
-
-      return true;
-    } catch {
-      await done.catch(() => undefined);
-
-      return false;
-    }
-  };
-
   /** A load that lost a lift to another tab reads again once: that tab's rewrite is readable now. */
   let again = false;
 
@@ -480,19 +365,30 @@ export function indexedReplica<T, P, S, C, O>(options: {
         typeof point === "object" && point !== null ? Reflect.get(point, "dataset") : null;
 
       // Another release's copy, and this one can lift it: rewritten under this release's shapes, claiming no history.
-      if (typeof written === "string" && !ours(written) && typeof held === "string") {
-        const up = lift(written, tables);
+      if (
+        options.lifts !== undefined &&
+        typeof written === "string" &&
+        !ours(written) &&
+        typeof held === "string"
+      ) {
         const partial = check(partialSchema, Reflect.get(point ?? {}, "history"));
-        const history: History = up?.partial === true && partial.ok ? partial.value : COMPLETE;
-
         const revision = typeof disk === "number" ? disk : 0;
 
-        const wrote =
-          up !== undefined &&
-          (!up.partial || partial.ok) &&
-          (await rewrite({ dataset: held, revision, shapes: written }, up.tables, history));
+        const up = await options.lifts.lift({
+          written,
+          dataset: held,
+          revision,
+          stored: tables,
+          history: partial.ok ? partial.value : undefined,
+          tables: options.tables,
+          empty: options.empty,
+          shapes: { complete: shapes, partial: partialShapes },
+          database: await db(),
+          guard,
+          ...(options.interfere === undefined ? {} : { interfere: options.interfere }),
+        });
 
-        if (up !== undefined && !wrote && !again) {
+        if (up === "lost" && !again) {
           again = true;
 
           try {
@@ -502,16 +398,22 @@ export function indexedReplica<T, P, S, C, O>(options: {
           }
         }
 
-        if (up !== undefined && wrote) {
+        if (up !== undefined && up !== "lost") {
           loaded = {
             dataset: held,
             revision,
-            shapes: history.kind === "partial" ? partialShapes : shapes,
+            shapes: up.history.kind === "partial" ? partialShapes : shapes,
           };
           discarded = null;
 
           return {
-            replica: { dataset: held, revision, tables: up.tables, server: null, history },
+            replica: {
+              dataset: held,
+              revision,
+              tables: up.tables,
+              server: null,
+              history: up.history,
+            },
             commands,
             unreadable,
             restart: "paged",

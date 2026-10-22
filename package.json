@@ -74,6 +74,10 @@
       "types": "./dist/web/replica.d.ts",
       "default": "./dist/web/replica.js"
     },
+    "./web/lift": {
+      "types": "./dist/web/lift.d.ts",
+      "default": "./dist/web/lift.js"
+    },
     "./web/idb": {
       "types": "./dist/web/idb.d.ts",
       "default": "./dist/web/idb.js"

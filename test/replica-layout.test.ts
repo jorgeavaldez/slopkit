@@ -8,6 +8,7 @@ import { Replaced } from "../src/client.ts";
 import { boolean, literal, nullable, number, object, optional, string } from "../src/schema.ts";
 import { table } from "../src/sync.ts";
 import type { Key } from "../src/sync.ts";
+import { lifting } from "../src/web/lift.ts";
 import { indexedReplica } from "../src/web/replica.ts";
 
 const row = object(
@@ -53,6 +54,8 @@ const port = (factory: IDBFactory, name: string, tables: ReturnType<typeof lens>
     empty,
     server: object({ build: string() }),
     pending,
+    // A release that adds a table keeps the copy only with lifting; a forgotten bump must not stop that.
+    lifts: lifting({}),
   });
 
 const copy = (dataset: string, revision: number, value: number) => ({
