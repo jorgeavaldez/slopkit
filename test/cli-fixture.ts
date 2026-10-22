@@ -160,7 +160,18 @@ const options = {
     const rows = store.db.prepare('select id,value from notes order by id').all();
     if (config.proof) { appendFileSync(config.proof, JSON.stringify({ version, home, env: Object.keys(env).sort(), rows, web, pid: process.pid }) + '\\n'); }
     let releaseReady; const gate = new Promise(resolve => { releaseReady = resolve; });
+    const apiRequests = [];
     const server = createServer((request, response) => {
+      if (request.url === '/requests') { response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(apiRequests)); return; }
+      if (request.url === '/api/') {
+        const host = request.headers.host;
+        apiRequests.push({ path: request.url, method: request.method, host, accept: request.headers.accept, cookie: request.headers.cookie, authorization: request.headers.authorization });
+        const publicHost = web.host ? web.host.name + (web.host.https ? '' : ':' + web.port) : undefined;
+        const localHost = '127.0.0.1:' + server.address().port;
+        response.statusCode = host !== localHost && host !== publicHost ? 421 : host === publicHost ? (config.publicApiStatus ?? 401) : (config.apiStatus ?? 401);
+        if (response.statusCode === 302) { response.setHeader('location', '/unexpected'); }
+        response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ kind: 'unauthenticated' })); return;
+      }
       if (request.url === '/gate') { response.end('released'); releaseReady(); return; }
       if (request.url === '/update') { const asked = askUpdate(jobs, config.release || 'edge', version, { client: 'fixture_page', id: 1 }); response.on('finish', () => update()); response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(asked)); return; }
       response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ version, rows, pid: process.pid }));
