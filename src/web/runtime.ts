@@ -126,6 +126,8 @@ export function createRuntime<
     /** The outbox's command schema; default the api's. */
     pending?: Schema<Pending<C, O>>;
     legacy?: { store: string; convert: (value: unknown) => Pending<C, O> | undefined };
+    /** By table: an earlier release's row as this one reads it, so an upgrade keeps the offline copy (`web/replica`). */
+    lifts?: Readonly<Record<string, (row: unknown) => unknown>>;
   };
   /** How long a push may take before it counts as lost (default 30 s). */
   pushTimeoutMs?: number;
@@ -160,6 +162,7 @@ export function createRuntime<
     server: api.server,
     pending: options.replica.pending ?? api.pending,
     ...(options.replica.legacy === undefined ? {} : { legacy: options.replica.legacy }),
+    ...(options.replica.lifts === undefined ? {} : { lifts: options.replica.lifts }),
   });
 
   const events: { name: string; at: string; attributes?: Attributes }[] = [];

@@ -29,9 +29,9 @@ seeded network's PRNG and scheduler.
 ## Budgets
 
 - **Kit client core**, gated by `pack:check` on the packed package: `schema`, `contract`, `api`, `sync`, `client`,
-  `machine`, `money`, `digest`, `states`, `web/replica` and `web/runtime`, minified and gzipped together, ≤ 16,486
-  bytes (16,486 measured; the paged first copy added 1,470, refused pushes and the bounded outbox 1,755, the sync
-  contract and the page's runtime 2,428, in place of each app's own, and a working state's owed work 107).
+  `machine`, `money`, `digest`, `states`, `web/replica` and `web/runtime`, minified and gzipped together, ≤ 16,972
+  bytes (16,972 measured; the paged first copy added 1,470, refused pushes and the bounded outbox 1,755, the sync
+  contract and the page's runtime 2,428, in place of each app's own, a working state's owed work 107, and an upgrade keeping the offline copy 486).
   `cron` is browser-safe but outside the core; an app that ships it counts it in its own budget. The budget grows only
   with a new entry or guarantee, by its measured size.
 - **Hello app** (preact, signals, and `sync`, `client`, `web/replica`, `schema`, `contract`, `states`): ≤ 17 KB gzip

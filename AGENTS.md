@@ -19,7 +19,10 @@ or the kit's own tests in `test/`.
   resolved at the next start after a stop, final once finished, `overdue` past its deadline.
 - A replica only moves forward, on disk too (`web/replica`): a commit is decided against the stored checkpoint inside
   its own transaction; a forget moves a generation every writer checks; the outbox is per command and survives
-  upgrades. A cached copy is read only under the row shapes that wrote it (`Schema.shape`, kept with the checkpoint).
+  upgrades. A cached copy is read only under the row shapes that wrote it (`Schema.shape`, kept with the checkpoint),
+  or lifted from an earlier release's: unchanged tables kept, changed ones through the app's `lifts`, new ones empty,
+  rewritten whole and claiming no history (revision 0) until a reset replaces it; a copy with a table this release
+  doesn't have starts over.
   A partial copy's history is kept with its rows, under row shapes marked partial so a release from before paging
   never reads it; a delta takes a page's history only at the cursor that page moved from.
 - Nothing is sent before it is kept, and no push before it is kept as in flight; observed and saved revisions are
