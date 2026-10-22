@@ -235,17 +235,75 @@ const done = (revision: number): Pending<Command, Outcome>["state"] => ({
   outcome: { kind: "ok", resource: "x" },
 });
 
-test.each<Pending<Command, Outcome>["state"]>([
-  { kind: "saving" },
+test.each<Pending<Command, Outcome>["state"]>([{ kind: "saving" }, { kind: "sending" }])(
+  "a command being saved or sent is under way: %j",
+  (state) => {
+    expect(
+      check(
+        line("checking…", commandDebt),
+        world({
+          ...quiet(),
+          visible: false,
+          connection: { kind: "offline", failure: "network down" },
+          commands: [pending(state)],
+        })
+      )
+    ).toStrictEqual([]);
+  }
+);
+
+const unsent: Pending<Command, Outcome>["state"][] = [
   { kind: "queued" },
-  { kind: "sending" },
   { kind: "unknown", failure: "lost" },
-  { kind: "unknown", failure: "refused", parked: true },
-  done(6),
-])("unsettled command %j is real", (state) => {
-  expect(
-    check(line("checking…", commandDebt), world({ ...quiet(), commands: [pending(state)] }))
-  ).toStrictEqual([]);
+];
+
+test.each(unsent)(
+  "an unsent command %j needs a due push and a live or stale connection",
+  (state) => {
+    const model: M = {
+      ...quiet(),
+      commands: [pending(state)],
+      push: { kind: "idle", nextAt: now, failures: 0 },
+    };
+
+    for (const connection of [{ kind: "live" as const }, { kind: "stale" as const }]) {
+      expect(check(line("checking…", commandDebt), world({ ...model, connection }))).toStrictEqual(
+        []
+      );
+      expect(
+        check(line("checking…", commandDebt), world({ ...model, connection, visible: false }))
+      ).toStrictEqual([]);
+      expect(
+        check(
+          line("checking…", commandDebt),
+          world({ ...model, connection, push: { kind: "idle", nextAt: now + 1, failures: 1 } })
+        )
+      ).toStrictEqual([badCommand]);
+    }
+
+    for (const connection of [
+      { kind: "offline" as const, failure: "network down" },
+      { kind: "starting" as const },
+      { kind: "signed-out" as const },
+      { kind: "incompatible" as const, failure: "upgrade required" },
+    ]) {
+      expect(check(line("checking…", commandDebt), world({ ...model, connection }))).toStrictEqual([
+        badCommand,
+      ]);
+    }
+  }
+);
+
+test.each(unsent)("an unsent command %j counts while its push is in flight", (state) => {
+  const model: M = {
+    ...quiet(),
+    visible: false,
+    connection: { kind: "offline", failure: "network down" },
+    commands: [pending(state)],
+    push: { kind: "pushing", client: "earlier-page", ids: [7], was: [state], failures: 0 },
+  };
+
+  expect(check(line("checking…", commandDebt), world(model))).toStrictEqual([]);
 });
 
 test.each([0, 4, 5])("done command at revision %i is settled", (revision) => {
@@ -325,6 +383,60 @@ const owedPulls = [
   ["pull due", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now, failures: 0 } })],
   ["pull overdue", (m: M): M => ({ ...m, pull: { kind: "idle", nextAt: now - 1, failures: 0 } })],
 ] as const;
+
+const awaitingPull: Pending<Command, Outcome>["state"][] = [
+  done(6),
+  { kind: "unknown", failure: "refused", parked: true },
+];
+
+test.each(awaitingPull)(
+  "an answered or parked command %j is not under way without a pull owed",
+  (state) => {
+    expect(
+      check(line("checking…", commandDebt), world({ ...quiet(), commands: [pending(state)] }))
+    ).toStrictEqual([badCommand]);
+  }
+);
+
+test.each(owedPulls)("an answered or parked command needs %s to be allowed", (_name, change) => {
+  for (const state of awaitingPull) {
+    const model = { ...change(quiet()), commands: [pending(state)] };
+    expect(check(line("checking…", commandDebt), world(model))).toStrictEqual([]);
+
+    for (const blocked of [
+      { ...model, visible: false },
+      { ...model, connection: { kind: "signed-out" as const } },
+      { ...model, connection: { kind: "incompatible" as const, failure: "upgrade required" } },
+    ]) {
+      expect(check(line("checking…", commandDebt), world(blocked))).toStrictEqual([badCommand]);
+    }
+  }
+});
+
+test.each(awaitingPull)(
+  "an answered or parked command %j counts while a pull is in flight",
+  (state) => {
+    const model: M = {
+      ...quiet(),
+      visible: false,
+      connection: { kind: "signed-out" },
+      commands: [pending(state)],
+      pull: { kind: "pulling", since: 5, failures: 0 },
+    };
+
+    expect(check(line("checking…", commandDebt), world(model))).toStrictEqual([]);
+  }
+);
+
+test("a settled command never counts even while a pull is in flight", () => {
+  const model: M = {
+    ...quiet(),
+    commands: [pending(done(5))],
+    pull: { kind: "pulling", since: 5, failures: 0 },
+  };
+
+  expect(check(line("checking…", commandDebt), world(model))).toStrictEqual([badCommand]);
+});
 
 const duePushes = [
   [

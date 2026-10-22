@@ -79,7 +79,13 @@ function initial(): PageModel {
     sync: {
       ...sync,
       boot: { kind: "ready" },
+      visible: true,
+      connection: { kind: "live" },
       replica: { ...sync.replica, dataset: "dataset-a", revision: 5 },
+      saved: { ...sync.saved, dataset: "dataset-a", revision: 5, writing: 0 },
+      target: 5,
+      pull: { kind: "idle", nextAt: 1100, failures: 0 },
+      push: { kind: "idle", nextAt: 100, failures: 0 },
     },
   };
 }
