@@ -3,7 +3,6 @@ import { join } from "node:path";
 import type { SQLOutputValue } from "node:sqlite";
 
 import type { WebConfig } from "../../src/server/config.ts";
-import { Jobs } from "../../src/server/jobs.ts";
 import type { Logger } from "../../src/server/log.ts";
 import { serveSync, syncHandlers } from "../../src/server/sync.ts";
 import { rawRoute } from "../../src/server/web.ts";
@@ -16,20 +15,8 @@ export type ServerInput = { home: string; web: WebConfig; now: () => number; log
 export async function startServer({ home, web, now, log }: ServerInput) {
   const store = new Store(join(home, "page.sqlite"));
   store.put("seed", 42);
-  store.db.exec(`create table jobs(
-    id integer primary key, kind text not null check(length(kind)>0), key text not null,
-    state text not null check(state in ('due','running','done','failed')),
-    due_at text not null, deadline_at text not null, attempts integer not null default 0 check(attempts>=0),
-    note text, result text check((state='done')=(result is not null)),
-    who text check((state='failed')=(who is not null) and (who is null or who in ('you','us','gone'))),
-    reason text check((state='failed')=(reason is not null)), asked_by text not null default '[]',
-    created_at text not null, updated_at text not null);
-    create unique index jobs_open on jobs(kind,key) where state in ('due','running');`);
 
-  const jobs = new Jobs<string>({
-    db: store.db,
-    transaction: (body) => store.transaction(body),
-    now,
+  const jobs = store.createJobs<string>({
     encode: JSON.stringify,
     decode: (text) => JSON.parse(text),
   });
