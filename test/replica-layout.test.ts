@@ -5,7 +5,7 @@ import { IDBFactory } from "fake-indexeddb";
 import { expect, test } from "vitest";
 
 import { Replaced } from "../src/client.ts";
-import { boolean, literal, nullable, number, object, string } from "../src/schema.ts";
+import { boolean, literal, nullable, number, object, optional, string } from "../src/schema.ts";
 import { table } from "../src/sync.ts";
 import type { Key } from "../src/sync.ts";
 import { indexedReplica } from "../src/web/replica.ts";
@@ -38,6 +38,7 @@ const pending = object({
   client: string(),
   id: number({ integer: true, min: 1 }),
   dataset: nullable(string()),
+  since: optional(number({ integer: true, min: 0 })),
   command: object({ name: literal("put") }),
   at: number(),
   state: object({ kind: literal("queued") }),
@@ -61,9 +62,9 @@ const copy = (dataset: string, revision: number, value: number) => ({
   tables: { ...empty, rows: new Map([["a", { id: "a", value, deleted: false }]]) },
 });
 
-// Any change to a table's name set or row schema starts the rows over, and the outbox survives and stays readable, with
-// no number to bump by hand: a release that adds a table keeps `version`.
-test("a table added without a version bump starts the rows over and keeps the outbox", async () => {
+// Adding a table keeps unchanged tables and opens the new one empty, with no number to bump by hand.
+// The kept rows claim revision zero until a reset replaces them; waiting commands keep their own history.
+test("a table added without a version bump keeps the rows and the outbox", async () => {
   const factory = new IDBFactory();
   const name = `layout-${randomUUID()}`;
   const before = port(factory, name, [lens("rows")]);
@@ -72,6 +73,7 @@ test("a table added without a version bump starts the rows over and keeps the ou
     client: "old-page",
     id: 1,
     dataset: "d1",
+    since: 5,
     command: { name: "put" },
     at: 1,
     state: { kind: "queued" },
@@ -79,8 +81,22 @@ test("a table added without a version bump starts the rows over and keeps the ou
   await before.commit({ replica: copy("d1", 7, 1), reset: true, base: 0, replaces: null, ops: [] });
   const after = port(factory, name, [lens("rows"), lens("notes")]);
   const loaded = await after.load();
-  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0 });
-  expect(loaded.commands).toMatchObject([{ client: "old-page", id: 1 }]);
+  expect(loaded.replica).toMatchObject({ dataset: "d1", revision: 0, server: null });
+  expect([...loaded.replica.tables.rows.values()]).toStrictEqual([
+    { id: "a", value: 1, deleted: false },
+  ]);
+  expect([...loaded.replica.tables.notes.values()]).toStrictEqual([]);
+  expect(loaded.commands).toStrictEqual([
+    {
+      client: "old-page",
+      id: 1,
+      dataset: "d1",
+      since: 5,
+      command: { name: "put" },
+      at: 1,
+      state: { kind: "queued" },
+    },
+  ]);
 });
 
 // A replica only moves forward, on disk too: a page still open on the previous release (other row shapes, same object
