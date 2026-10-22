@@ -57,6 +57,70 @@ test("an app's own session cookie signs its requests in", async () => {
   }
 });
 
+// A link opened before signing in is where the person meant to go: the sign-in comes back to it, and only ever to a
+// path on this server.
+test("sign-in returns to the page it interrupted, never off this server", async () => {
+  const home = await mkdtemp(join(tmpdir(), "slopkit-web-"));
+  const provider = await identityProvider("someone");
+  await writeFile(join(home, "index.html"), "<!doctype html>");
+
+  const server = await serveWeb({
+    home,
+    config: parseWebConfig(
+      { port: 0, oidc: { issuer: provider.issuer, clientId: "test" }, allow: ["sub:someone"] },
+      []
+    ),
+    env: {},
+    log: () => {},
+    assets: home,
+    manifest: {},
+    cookie: "hello_session",
+    routes: [route(who, (_request, caller) => ({ identities: caller.identities }))],
+  });
+
+  /** Follow a sign-in from `start` (with the cookies it sets) to where the callback sends the browser. */
+  const signIn = async (start: Response): Promise<string | null> => {
+    const login = new URL(start.headers.get("location") ?? "", server.url);
+    let response = await fetch(login, { redirect: "manual" });
+    const back = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    response = await fetch(response.headers.get("location") ?? "", { redirect: "manual" });
+    response = await fetch(response.headers.get("location") ?? "", {
+      redirect: "manual",
+      headers: { cookie: back },
+    });
+    expect(response.status).toBe(302);
+    expect(response.headers.get("set-cookie") ?? "").toMatch(/^hello_session=./);
+
+    return response.headers.get("location");
+  };
+
+  try {
+    const page = await fetch(new URL("/c/abc123?item=a.png", server.url), {
+      redirect: "manual",
+      headers: { accept: "text/html" },
+    });
+
+    expect(page.status).toBe(302);
+    expect(await signIn(page)).toBe("/c/abc123?item=a.png");
+
+    for (const elsewhere of ["//evil.example/x", "/\\evil.example", "https://evil.example/"]) {
+      const forged = new Response(null, {
+        status: 302,
+        headers: { location: `/auth/login?back=${encodeURIComponent(elsewhere)}` },
+      });
+
+      expect(await signIn(forged)).toBe("/");
+    }
+
+    const plain = new Response(null, { status: 302, headers: { location: "/auth/login" } });
+    expect(await signIn(plain)).toBe("/");
+  } finally {
+    await server.close();
+    await provider.close();
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 // A build may keep a brotli copy beside a file: a client that takes brotli gets those bytes, any other the file itself
 // (gzipped when it takes that), so every client decodes to the same asset.
 test("a file's brotli copy goes only to a client that takes brotli", async () => {

@@ -240,6 +240,27 @@ function sessionToken(request: IncomingMessage, cookie: string): string | undefi
     ?.slice(cookie.length + 1);
 }
 
+/** How long a sign-in keeps the page it interrupted. */
+const BACK_SECONDS = 600;
+
+function decodeCookie(value: string | undefined): string | undefined {
+  try {
+    return value === undefined ? undefined : decodeURIComponent(value);
+  } catch {
+    return undefined;
+  }
+}
+
+/** A path on this server to return to, or nothing: never another origin (`//host`, `/\\host`, a scheme). */
+function onThisServer(path: string | null | undefined): string | undefined {
+  return path !== null &&
+    path !== undefined &&
+    path.length <= 2048 &&
+    /^\/(?![/\\])[^\s\\]*$/.test(path)
+    ? path
+    : undefined;
+}
+
 /** Send a body, gzipped when the client takes it and it is worth it. */
 function send(
   request: IncomingMessage,
@@ -691,7 +712,13 @@ export async function serveWeb(
           return send(request, response, 404, "No login here");
         }
 
-        return send(request, response, 302, "", { location: await auth.loginUrl(callback) });
+        const back = onThisServer(url.searchParams.get("back"));
+
+        return send(request, response, 302, "", {
+          location: await auth.loginUrl(callback),
+          // Where the sign-in returns, for the callback; only a path on this server is kept.
+          "set-cookie": `${cookie}_back=${back === undefined ? "" : encodeURIComponent(back)}; Path=/auth; HttpOnly;${secure} SameSite=Lax; Max-Age=${back === undefined ? 0 : BACK_SECONDS}`,
+        });
       }
 
       if (url.pathname === "/auth/callback" && request.method === "GET") {
@@ -702,9 +729,11 @@ export async function serveWeb(
           );
 
           log("info", "signed in");
+          // Every sign-in starts at /auth/login, which sets or clears this, so it is never an older one's.
+          const back = onThisServer(decodeCookie(sessionToken(request, `${cookie}_back`)));
 
           return send(request, response, 302, "", {
-            location: "/",
+            location: back ?? "/",
             "set-cookie": `${cookie}=${token}; Path=/; HttpOnly;${secure} SameSite=Lax; Max-Age=${7 * 86_400}`,
           });
         } catch (error) {
@@ -749,7 +778,9 @@ export async function serveWeb(
           request.method === "GET" && (header(request, "accept") ?? "").includes("text/html");
 
         if (caller === undefined && navigation && auth.oidc) {
-          return send(request, response, 302, "", { location: "/auth/login" });
+          return send(request, response, 302, "", {
+            location: `/auth/login?back=${encodeURIComponent(url.pathname + url.search)}`,
+          });
         }
 
         return failure(
