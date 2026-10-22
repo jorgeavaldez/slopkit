@@ -34,6 +34,10 @@
       "types": "./dist/contract.d.ts",
       "default": "./dist/contract.js"
     },
+    "./api": {
+      "types": "./dist/api.d.ts",
+      "default": "./dist/api.js"
+    },
     "./sync": {
       "types": "./dist/sync.d.ts",
       "default": "./dist/sync.js"
@@ -74,6 +78,10 @@
       "types": "./dist/web/idb.d.ts",
       "default": "./dist/web/idb.js"
     },
+    "./web/runtime": {
+      "types": "./dist/web/runtime.d.ts",
+      "default": "./dist/web/runtime.js"
+    },
     "./server/ledger": {
       "types": "./dist/server/ledger.d.ts",
       "default": "./dist/server/ledger.js"
@@ -86,6 +94,14 @@
       "types": "./dist/server/pull.d.ts",
       "default": "./dist/server/pull.js"
     },
+    "./server/store": {
+      "types": "./dist/server/store.d.ts",
+      "default": "./dist/server/store.js"
+    },
+    "./server/sync": {
+      "types": "./dist/server/sync.d.ts",
+      "default": "./dist/server/sync.js"
+    },
     "./server/web": {
       "types": "./dist/server/web.d.ts",
       "default": "./dist/server/web.js"
@@ -93,6 +109,10 @@
     "./server/auth": {
       "types": "./dist/server/auth.d.ts",
       "default": "./dist/server/auth.js"
+    },
+    "./server/cli": {
+      "types": "./dist/server/cli.d.ts",
+      "default": "./dist/server/cli.js"
     },
     "./server/config": {
       "types": "./dist/server/config.d.ts",

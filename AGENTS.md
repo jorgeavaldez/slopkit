@@ -8,8 +8,8 @@ ships in the package. `README.md` covers the entries and their use, `DEPS.md` th
 Each is enforced at one place, named here, and pinned by a test: the conformance suite (`src/conformance/README.md`)
 or the kit's own tests in `test/`.
 
-- Pure entries (`schema`, `contract`, `sync`, `client`, `machine`, `money`, `digest`, `cron`, `states`) import no
-  Node built-in and no DOM (lint, `test/lint-boundaries.test.ts`).
+- Pure entries (`schema`, `contract`, `api`, `sync`, `client`, `machine`, `money`, `digest`, `cron`, `states`) import
+  no Node built-in and no DOM (lint, `test/lint-boundaries.test.ts`).
 - A command acts at most once for whoever sent it, forever (`server/ledger`): claimed in a committed transaction before
   it acts; authorization before any replay; receipts name resources by id and arrive in the pull with the revision that
   holds their effects. Retention never deletes a key: an old receipt retires and never acts. Push handlers return
@@ -37,6 +37,21 @@ or the kit's own tests in `test/`.
   a delta that can't fit by itself answered as a paged reset (else the older page shrinks to the room it leaves),
   `through` only over whole order groups, and every row a receipt names in the reply that carries it. A reply that
   can't fit is refused, never sent over the caps. A request without `page` keeps the whole reply of before.
+- A replicated store opens only what it can read (`server/store`): a store newer than the release, or older than its
+  base schema, is refused before anything is written; a store with data is copied whole before a migration, each
+  migration commits alone with its foreign keys checked; replicated rows carry the revision stamped in their own
+  transaction and are never deleted (triggers); the newest revision served is kept beside the store before its reply
+  leaves, so a restored store takes a new dataset.
+- A push acts only on the history it was tapped against (`server/sync`): another dataset or an unknown revision runs
+  none of its commands; authorization comes before the ledger on every command, replays included; served before
+  replied. Its handlers' answers include the kit's own refusals, so an outcome schema that can't carry them doesn't
+  compile where they meet the api.
+- The page's runtime decides nothing (`web/runtime`): the socket only pokes and reconnects with capped backoff;
+  telemetry is bounded and never trusted for who sent it (`server/sync` sets the sender).
+- Nothing replaces a release that hasn't started on the home's data (`server/cli`): an update installs aside and boots
+  on copies of the store and settings first; each install keeps the one it replaced; a rollback never crosses a
+  migration without the store copy from before it; an automatic rollback only undoes an update that never proved
+  itself, never back and forth.
 - Every untrusted boundary is checked by a schema (`schema`); nothing is coerced. Money is safe-integer minor units.
 - Replicated rows carry the current revision and are never deleted (tombstones), by trigger, not habit.
 - What a screen says is decided by tables (`states`): a subject's states are a closed union and its table places

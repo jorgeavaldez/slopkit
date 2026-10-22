@@ -43,17 +43,21 @@ export default defineConfig({
   },
   overrides: [
     {
-      // Where untyped input becomes typed: schemas, config, session and key files, IndexedDB records, SQL rows, replies.
+      // Where untyped input becomes typed: schemas, config, session and key files, IndexedDB records, SQL rows, replies,
+      // the store's head file, the socket's messages, and a release's package, records and output.
       files: [
         "src/schema.ts",
         "src/client.ts",
         "src/server/auth.ts",
+        "src/server/cli.ts",
         "src/server/config.ts",
         "src/server/keys.ts",
         "src/server/ledger.ts",
         "src/server/pull.ts",
+        "src/server/store.ts",
         "src/server/web.ts",
         "src/web/replica.ts",
+        "src/web/runtime.ts",
         "scripts/pack-check.ts",
       ],
       rules: {

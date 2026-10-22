@@ -21,11 +21,12 @@ import { build } from "esbuild";
  * The kit's client core (`DEPS.md`), minified and gzipped together: it grows only with a new entry or guarantee, by its
  * measured size. `cron` is browser-safe but outside the core.
  */
-const BROWSER_BUDGET_GZIP_BYTES = 13_951;
+const BROWSER_BUDGET_GZIP_BYTES = 16_379;
 
 const BROWSER = [
   "schema",
   "contract",
+  "api",
   "sync",
   "client",
   "machine",
@@ -33,6 +34,7 @@ const BROWSER = [
   "digest",
   "states",
   "web/replica",
+  "web/runtime",
 ];
 
 const root = resolve(import.meta.dirname, "..");

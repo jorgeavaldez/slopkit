@@ -159,6 +159,73 @@ import { pullConformance } from "slopkit/conformance/pull";
 pullConformance({ name: "my app", create: async (limits) => fixtureOverMyRealStore(limits) });
 ```
 
+### the app shell
+
+the page's runtime, the server's sync, the store and the command line are the same in every app, so they live here.
+an app declares its rows, commands and outcomes once:
+
+```ts
+import { syncApi } from "slopkit/api";
+
+// pull, push, telemetry and the socket's poke, plus the outbox record. rows need an `id`
+export const api = syncApi({ rows: { notes: note, tags: tag }, server, command, outcome });
+```
+
+the store is the kit's core (meta, revisions, the command ledger, jobs) plus your tables:
+
+```ts
+import { schemaVersion, SyncStore } from "slopkit/server/store";
+
+const SCHEMA = { base: "create table notes(...) strict; ...", replicated: ["notes", "tags"], baseVersion: 1,
+  migrations: [], indexes: "create index if not exists notes_order on notes(at, id, deleted);" };
+
+class Store extends SyncStore {
+  readonly ledger = this.createLedger<Kept>({ encode: JSON.stringify, decode: readKept });
+  constructor(path: string) { super(path, { name: "notes", schema: SCHEMA }); }
+}
+```
+
+the server answers pull and push over it, and serves them with the poke socket and telemetry:
+
+```ts
+import { serveSync, syncHandlers } from "slopkit/server/sync";
+
+const sync = syncHandlers({ api, store, ledger: store.ledger, log, server: (caller) => facts(caller),
+  history: { row: "notes", table: "notes", order: ["at", "id"], version: 1, live: "deleted = 0", read: toNote,
+    through: ([at]) => String(at) },
+  unpaged: (since) => ({ tags: store.tags(since) }), everything: () => store.everything(),
+  names: (kept) => [kept.note], limits, act: (command) => ({ local: () => store.apply(command) }),
+  outcome: (kept) => kept });
+
+await serveSync({ name: "notes", api, sync, home, config, env, log, page, assets: "dist/web" });
+```
+
+your outcome union must admit the kit's own answers (`failed` with `conflict` or `forbidden`, and `retired`): if it
+can't, `serveSync` doesn't compile. the page runs the same engine headless or in a browser:
+
+```ts
+import { createRuntime } from "slopkit/web/runtime";
+
+const runtime = createRuntime({ name: "notes", sync, api, replica: { version: 1, tables, empty } });
+runtime.subscribe((model) => draw(model));
+runtime.start();
+```
+
+and `main.ts` is the command line: `serve | update | rollback | version`, one server per home, releases that boot on
+a copy of the store before they replace the running one, and automatic rollback of a crashing update:
+
+```ts
+import { runCli } from "slopkit/server/cli";
+
+process.exitCode = await runCli(process.argv.slice(2), {
+  name: "notes", root: new URL("../", import.meta.url), schema: schemaVersion(SCHEMA), serves: "your notes.",
+  serve: async ({ home, version, log, web, env }) => {
+    /* open the store, serveSync when web isn't off */
+    return { url, close };
+  },
+});
+```
+
 the shared lint rules go on top of ultracite's presets (`oxlint.config.ts`):
 
 ```ts
