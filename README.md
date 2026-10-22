@@ -212,8 +212,10 @@ runtime.subscribe((model) => draw(model));
 runtime.start();
 ```
 
-and `main.ts` is the command line: `serve | update | rollback | version`, one server per home, releases that boot on
-a copy of the store before they replace the running one, and automatic rollback of a crashing update:
+and `main.ts` is the command line: `serve | update | rollback | probe | version`, one server per home, releases that
+boot on a copy of the store before they replace the running one, automatic rollback of a crashing update, and `probe`,
+the live server checked from its host with no identity (it serves, the version that passed, no test login, requests
+without identity refused, the public door matching `web.json`):
 
 ```ts
 import { runCli } from "slopkit/server/cli";

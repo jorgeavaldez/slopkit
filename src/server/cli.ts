@@ -1,5 +1,6 @@
 /**
- * An app's command line and its releases: `serve | update | rollback | version`, the same for every app on the kit.
+ * An app's command line and its releases: `serve | update | rollback | probe | version`, the same for every app on the
+ * kit.
  *
  * - **One server per home,** held by a lock the OS releases if the process dies. Ready means ready: the line a
  *   supervisor waits for comes only once the app serves, and a home whose `web.json` can't be served is degraded.
@@ -42,6 +43,8 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { isIP } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -58,6 +61,7 @@ import type { Logger } from "./log.ts";
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const CHECK_TIMEOUT_MS = 60_000;
+const LOCK_WAIT_MS = 1000;
 
 /** A release that has stayed up this long in one server on a home is proven: a crash loop after it isn't its update's. */
 const PROVEN_AFTER_MS = 3_600_000;
@@ -826,7 +830,8 @@ export function running(home: string): boolean {
  */
 function lock(home: string): DatabaseSync | undefined {
   mkdirSync(home, { recursive: true, mode: 0o700 });
-  const owner = new DatabaseSync(join(home, "owner.sqlite"));
+  // A probe's look at the lock (`running`) holds it for an instant: waited out, never taken for a server.
+  const owner = new DatabaseSync(join(home, "owner.sqlite"), { timeout: LOCK_WAIT_MS });
 
   try {
     owner.exec("BEGIN EXCLUSIVE");
@@ -1542,6 +1547,9 @@ async function serve(app: Package, options: CliOptions, home: string): Promise<n
     return 1;
   }
 
+  // A record a killed run left behind says nothing of this one.
+  rmSync(join(home, "serving.json"), { force: true });
+
   const log = new Log(home, app.name);
   const say = scoped(log, "server");
   const warnings: string[] = [];
@@ -1580,6 +1588,21 @@ async function serve(app: Package, options: CliOptions, home: string): Promise<n
   });
 
   say("info", "started", { pid: process.pid, version: app.version, web: served.url ?? null });
+  const serving = join(home, "serving.json");
+  // The start is in the log before anything says it serves, so a probe right after ready finds the home at rest.
+  await log.flushed();
+
+  // Before the ready line, so whatever waits for it can probe at once.
+  try {
+    writeRecord(serving, {
+      version: app.version,
+      pid: process.pid,
+      ...(served.url === undefined ? {} : { url: served.url }),
+      at: new Date().toISOString(),
+    });
+  } catch (error) {
+    say("warn", "couldn't record that it serves", { reason: reason(error) });
+  }
 
   // The update check and a supervisor's readiness both wait for this line.
   console.log(
@@ -1614,6 +1637,7 @@ async function serve(app: Package, options: CliOptions, home: string): Promise<n
     ...(job === undefined ? {} : { job: job.id }),
   });
   await served.close();
+  rmSync(serving, { force: true });
 
   if (job === undefined) {
     owner.close();
@@ -1660,6 +1684,409 @@ async function serve(app: Package, options: CliOptions, home: string): Promise<n
   return await reexecute();
 }
 
+// The live server, checked from its host.
+
+/** What a running server says of itself (`<home>/serving.json`), written before its ready line, removed at its stop. */
+const servingRecord = object(
+  {
+    version: string({ min: 1, max: 100 }),
+    pid: number({ integer: true, min: 1 }),
+    url: optional(string({ min: 1, max: 2000 })),
+    at: string({ min: 1, max: 100 }),
+  },
+  { strict: true }
+);
+
+type Serving = { version: string; pid: number; url?: string; at: string };
+
+type ProbeFlags = { expect?: string; door?: string };
+
+const PROBE_TIMEOUT_MS = 10_000;
+
+/** A system error's code (`ECONNREFUSED`), else its message. */
+function errorCode(error: unknown): string {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string"
+  ) {
+    return error.code;
+  }
+
+  return reason(error);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+
+    return true;
+  } catch (error) {
+    // Alive, but another user's: the signal was refused, not undeliverable.
+    return errorCode(error) === "EPERM";
+  }
+}
+
+/** Only the kit's stand-in login lives on this machine; a live server's issuer never does. */
+function onThisMachine(url: string): boolean {
+  const host = new URL(url).hostname;
+
+  return host === "localhost" || host === "[::1]" || host.startsWith("127.");
+}
+
+/** An answer: its status, where it redirects, and whether it is the kit's own refusal of a request with no identity. */
+type Answer = { status: number; location: string | null; kit: boolean } | { error: string };
+
+/** The most of a body read to tell the kit's refusal (`{"kind":"signed-out",…}`) from another's. */
+const REFUSAL_BYTES = 4096;
+
+const refusal = object({ kind: literal("signed-out") });
+
+function kitRefusal(status: number, body: string): boolean {
+  if (status !== 401) {
+    return false;
+  }
+
+  try {
+    return refusal.parse(JSON.parse(body)).kind === "signed-out";
+  } catch {
+    return false;
+  }
+}
+
+/** A GET with no identity, sent to `url` under this `Host`: how it was answered. */
+function anonymous(url: string, host: string): Promise<Answer> {
+  return new Promise((resolve) => {
+    const sent = httpRequest(
+      url,
+      { headers: { host, accept: "application/json" }, timeout: PROBE_TIMEOUT_MS },
+      (response) => {
+        let body = "";
+
+        response.setEncoding("utf-8");
+        response.on("data", (chunk: string) => {
+          body = (body + chunk).slice(0, REFUSAL_BYTES);
+        });
+        response.once("end", () => {
+          const status = response.statusCode ?? 0;
+          resolve({
+            status,
+            location: response.headers.location ?? null,
+            kit: kitRefusal(status, body),
+          });
+        });
+      }
+    );
+
+    sent.once("timeout", () => {
+      sent.destroy(new Error("no answer in time"));
+    });
+    sent.once("error", (error) => {
+      resolve({ error: errorCode(error) });
+    });
+    sent.end();
+  });
+}
+
+/** How the door at `url` answers a request with no identity, redirects not followed. */
+async function knock(url: string): Promise<Answer> {
+  try {
+    const response = await fetch(url, {
+      redirect: "manual",
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    });
+
+    let body = "";
+
+    if (response.status === 401) {
+      body = (await response.text()).slice(0, REFUSAL_BYTES);
+    } else {
+      await response.body?.cancel();
+    }
+
+    return {
+      status: response.status,
+      location: response.headers.get("location"),
+      kit: kitRefusal(response.status, body),
+    };
+  } catch (error) {
+    return {
+      error:
+        error instanceof Error && error.cause !== undefined
+          ? errorCode(error.cause)
+          : reason(error),
+    };
+  }
+}
+
+const ACCESS_LOGIN = "/cdn-cgi/access/login/";
+
+/** The proxy's login a redirect goes to, if it is one. */
+function proxyLogin(answer: Answer): URL | undefined {
+  if (
+    "error" in answer ||
+    (answer.status !== 302 && answer.status !== 303) ||
+    answer.location === null
+  ) {
+    return undefined;
+  }
+
+  const location = URL.canParse(answer.location) ? new URL(answer.location) : undefined;
+
+  return location?.pathname.startsWith(ACCESS_LOGIN) === true ? location : undefined;
+}
+
+function servingProblem(
+  home: string,
+  found: Serving | undefined,
+  held: boolean
+): string | undefined {
+  if (!held) {
+    return found === undefined
+      ? `nothing runs on ${home}`
+      : `nothing runs on ${home} (serving.json is left from pid ${found.pid})`;
+  }
+
+  if (found === undefined) {
+    return `${home} is held, but no server says it serves (an update or a rollback holds it)`;
+  }
+
+  return pidAlive(found.pid)
+    ? undefined
+    : `serving.json names pid ${found.pid}, which isn't running`;
+}
+
+function versionProblem(
+  live: Serving | undefined,
+  installed: string,
+  expected: string | undefined
+) {
+  if (live === undefined) {
+    return "no running server";
+  }
+
+  if (live.version !== installed) {
+    return `running ${live.version}, installed ${installed}: restart it`;
+  }
+
+  return expected === undefined || live.version === expected
+    ? undefined
+    : `running ${live.version}, expected ${expected}`;
+}
+
+/** Both hosts the server answers, asked with no identity: each must be refused, 401. */
+/** Where the server listens, for a request from this host: its bound address at the url's port. */
+function listening(bind: string, url: string): string {
+  const address = bind === "0.0.0.0" ? "127.0.0.1" : bind === "::" ? "::1" : bind;
+
+  return `http://${isIP(address) === 6 ? `[${address}]` : address}:${new URL(url).port}/api/`;
+}
+
+/** Both hosts the server answers, asked with no identity on its bound address: each must get the kit's refusal. */
+async function refusedProblem(
+  url: string,
+  web: WebConfig
+): Promise<{ hosts: string[]; problem?: string }> {
+  const own = new URL(url);
+  const hosts = [own.host];
+
+  if (web.host !== undefined) {
+    // A plain-http host is served on web.port; port 0 is the one the system picked, the url's.
+    const port = web.port === 0 ? own.port : String(web.port);
+    // Asked as the public host even when it is the url's own: that is the request the door sends.
+    hosts.push(web.host.https ? web.host.name : `${web.host.name}:${port}`);
+  }
+
+  const target = listening(web.bind, url);
+  const answers = await Promise.all(hosts.map((host) => anonymous(target, host)));
+  const unreachable = answers.find((answer) => "error" in answer);
+
+  if (unreachable !== undefined && "error" in unreachable) {
+    return { hosts, problem: `nothing answers at ${target} (${unreachable.error})` };
+  }
+
+  const problems = answers.flatMap((answer, index) => {
+    if ("error" in answer || answer.kit) {
+      return [];
+    }
+
+    return answer.status === 421
+      ? [`the server doesn't answer ${hosts[index]} (421)`]
+      : [`${hosts[index]} answered ${answer.status} with no identity, not the kit's refusal`];
+  });
+
+  return problems.length === 0 ? { hosts } : { hosts, problem: problems.join("; ") };
+}
+
+/** The public door, knocked with no identity: a proxy web.json verifies sends it to that proxy's login. */
+function doorProblem(
+  target: string,
+  answer: Answer,
+  web: WebConfig,
+  host: string
+): string | undefined {
+  if ("error" in answer) {
+    return `${target} is unreachable (${answer.error})`;
+  }
+
+  const login = proxyLogin(answer);
+  const access = web.access;
+
+  if (access === undefined) {
+    return answer.kit || login !== undefined
+      ? undefined
+      : `${target} answered ${answer.status} with no identity, not the kit's refusal`;
+  }
+
+  if (answer.status === 401) {
+    return `the server answered itself (401): no proxy in front, though web.json expects ${access.teamDomain}`;
+  }
+
+  if (login === undefined) {
+    return `${target} answered ${answer.status}, not the proxy's login`;
+  }
+
+  if (login.origin !== new URL(access.teamDomain).origin) {
+    return `another team's door: ${login.origin}, web.json has ${access.teamDomain}`;
+  }
+
+  if (login.pathname.slice(ACCESS_LOGIN.length) !== host) {
+    return `the proxy's login is for ${login.pathname.slice(ACCESS_LOGIN.length)}, not ${host}`;
+  }
+
+  const kid = login.searchParams.get("kid");
+
+  return kid === access.audience
+    ? undefined
+    : `the door's audience is ${kid ?? "missing"}, web.json has ${access.audience}: every signed request would be refused`;
+}
+
+/** `probe` flags: undefined on bad usage. */
+function probeFlags(args: readonly string[]): ProbeFlags | undefined {
+  const flags: ProbeFlags = {};
+
+  for (let at = 0; at < args.length; at += 2) {
+    const value = args[at + 1];
+
+    if (value === undefined || value.startsWith("--")) {
+      return undefined;
+    }
+
+    if (args[at] === "--expect" && flags.expect === undefined) {
+      flags.expect = value;
+    } else if (
+      args[at] === "--door" &&
+      flags.door === undefined &&
+      URL.canParse(value) &&
+      ["http:", "https:"].includes(new URL(value).protocol)
+    ) {
+      flags.door = value;
+    } else {
+      return undefined;
+    }
+  }
+
+  return flags;
+}
+
+/** `probe [--expect <version>] [--door <url>]`: the server running on this home, checked with no identity. */
+async function runProbe(
+  app: Package,
+  args: readonly string[],
+  home: string
+): Promise<number | undefined> {
+  const flags = probeFlags(args);
+
+  if (flags === undefined) {
+    return undefined;
+  }
+
+  let failed = false;
+
+  const say = (name: string, problem: string | undefined, seen: string) => {
+    failed ||= problem !== undefined;
+    console.log(problem === undefined ? `ok ${name}: ${seen}` : `fail ${name}: ${problem}`);
+  };
+
+  const found = readRecord(join(home, "serving.json"), servingRecord);
+  const serving = servingProblem(home, found, running(home));
+  const live = serving === undefined ? found : undefined;
+  say("serving", serving, `pid ${found?.pid} since ${found?.at}`);
+  say(
+    "version",
+    versionProblem(live, app.version, flags.expect),
+    `running ${app.version}${flags.expect === undefined ? "" : ", as expected"}`
+  );
+
+  if (!existsSync(join(home, "web.json"))) {
+    say(
+      "login",
+      live?.url === undefined
+        ? undefined
+        : "serving a web, web.json is gone: the next start has none",
+      "no web"
+    );
+
+    return failed ? 1 : 0;
+  }
+
+  const web = await loadWebConfig(home, []);
+
+  if ("off" in web) {
+    say("login", `web off: ${web.off}`, "");
+
+    return 1;
+  }
+
+  const doors = [
+    ...(web.access === undefined ? [] : [`behind ${web.access.teamDomain}`]),
+    ...(web.oidc === undefined ? [] : [`signs in with ${web.oidc.issuer}`]),
+  ];
+
+  say(
+    "login",
+    web.oidc !== undefined && onThisMachine(web.oidc.issuer)
+      ? `web.oidc.issuer ${web.oidc.issuer} is on this machine: the test login`
+      : undefined,
+    doors.join(", ")
+  );
+
+  const url = live?.url;
+
+  if (url === undefined) {
+    say("refused", live === undefined ? "no running server" : "the running server has no web", "");
+  } else {
+    const refused = await refusedProblem(url, web);
+    say("refused", refused.problem, `401 for ${[...new Set(refused.hosts)].join(" and ")}`);
+  }
+
+  if (web.host === undefined) {
+    return failed ? 1 : 0;
+  }
+
+  const port = web.port === 0 && url !== undefined ? new URL(url).port : String(web.port);
+
+  const target =
+    flags.door ??
+    (web.host.https ? `https://${web.host.name}/` : `http://${web.host.name}:${port}/`);
+
+  const answer = await knock(target);
+  const login = proxyLogin(answer);
+
+  const seen =
+    web.access === undefined && login !== undefined
+      ? `behind ${login.origin}'s login, which web.json doesn't verify`
+      : web.access === undefined
+        ? `${target} reaches a server that refuses with no identity`
+        : `${target} goes to ${web.access.teamDomain}'s login for this audience`;
+
+  say("door", doorProblem(target, answer, web, web.host.name), seen);
+
+  return failed ? 1 : 0;
+}
+
 function help(options: CliOptions): string {
   const name = options.name;
   const extra = Object.entries(options.commands ?? {});
@@ -1677,6 +2104,10 @@ function help(options: CliOptions): string {
       "rollback",
       "Reinstall the release the last update replaced (kept in the home's releases/), with the server stopped, after it starts on a copy of the store. A release that writes an older store schema is refused unless --with-store also puts back the store from before that migration. --crashed is a supervisor's crash hook.",
     ],
+    [
+      "probe",
+      "Check the server running on the home from this host, with no identity: it serves, the version (--expect: the one that passed), no test login, requests without identity refused, and the public door (--door: where to knock) matching web.json.",
+    ],
     ...extra.map(([command, each]): [string, string] => [command, each.help]),
     [
       "version",
@@ -1688,6 +2119,7 @@ function help(options: CliOptions): string {
     "serve",
     "update [edge | <version>]",
     "rollback [--with-store | --crashed]",
+    "probe [--expect <version>] [--door <url>]",
     ...extra.map(([, each]) => each.usage),
     "version [--json]",
   ].join(" | ");
@@ -1742,6 +2174,18 @@ export async function runCli(args: readonly string[], options: CliOptions): Prom
 
   if (command === "rollback") {
     return await runRollback(app, options.schema, rest, home);
+  }
+
+  if (command === "probe") {
+    const code = await runProbe(app, rest, home);
+
+    if (code !== undefined) {
+      return code;
+    }
+
+    console.log(help(options));
+
+    return 2;
   }
 
   const own = options.commands?.[command];
