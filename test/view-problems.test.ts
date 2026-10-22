@@ -194,40 +194,60 @@ test.each([
   expect(check(line("checking…", jobDebt), { now, jobs })).toStrictEqual(real ? [] : [badJob]);
 });
 
-// The poke delay: the server finished the job, and the page can't have heard yet.
-const ended = (state: "done" | "failed", ago: number): NonNullable<World["jobs"]> => [
+// The poke delay: the server finished the job at revision 6, and the page's copy (at 5) doesn't hold it yet.
+const ended = (
+  state: "done" | "failed",
+  ago: number,
+  revision: number | null = 6
+): NonNullable<World["jobs"]> => [
   {
     kind: "check",
     key: "P1",
     state,
     dueAt: new Date(now - 60_000).toISOString(),
     updatedAt: new Date(now - ago).toISOString(),
+    ...(revision === null ? {} : { revision }),
   },
 ];
 
 test.each(["done", "failed"] as const)(
-  "a job %s within the socket's deadline is still under way until the page could have heard",
+  "a job %s is under way within the socket's deadline while the page can't have heard",
   (state) => {
-    expect(check(line("checking…", jobDebt), { now, jobs: ended(state, 1000) })).toStrictEqual([]);
+    const job = (ago: number) =>
+      check(line("checking…", jobDebt), { now, jobs: ended(state, ago) });
+
+    expect(job(1000)).toStrictEqual([]);
+    expect(job(SOCKET_DEADLINE_MS - 1)).toStrictEqual([]);
+    expect(job(SOCKET_DEADLINE_MS)).toStrictEqual([badJob]);
+    // No revision to hold it against: finished is finished.
     expect(
-      check(line("checking…", jobDebt), { now, jobs: ended(state, SOCKET_DEADLINE_MS - 1) })
-    ).toStrictEqual([]);
-    expect(
-      check(line("checking…", jobDebt), { now, jobs: ended(state, SOCKET_DEADLINE_MS) })
+      check(line("checking…", jobDebt), { now, jobs: ended(state, 1000, null) })
     ).toStrictEqual([badJob]);
   }
 );
 
-test("a job that ended before the page's copy last caught up isn't under way, unless a pull is", () => {
-  const caughtUp: M = { ...quiet(), reconciledAt: now - 500 };
+test("a just-finished job is under way only while the page's copy lacks its end and the page may yet hear it", () => {
   const jobs = ended("done", 1000);
-  expect(check(line("checking…", jobDebt), { now, jobs, model: caughtUp })).toStrictEqual([badJob]);
+  const shown = (model: M) => check(line("checking…", jobDebt), { now, jobs, model });
 
-  const before: M = { ...quiet(), reconciledAt: now - 2000 };
-  expect(check(line("checking…", jobDebt), { now, jobs, model: before })).toStrictEqual([]);
+  // A pull reply assembled before the end landed after it: the copy is still below the end, the poke on its way.
+  expect(shown({ ...quiet(), reconciledAt: now - 500 })).toStrictEqual([]);
+  // The copy holds the end (a pull got there before the poke): the line should have changed.
+  expect(shown({ ...quiet(), replica: { ...quiet().replica, revision: 6 } })).toStrictEqual([
+    badJob,
+  ]);
+  // The poke came (the page heard 6) but no pull is going to bring it.
+  expect(
+    shown({ ...quiet(), target: 6, pull: { kind: "idle", nextAt: now + 10_000, failures: 1 } })
+  ).toStrictEqual([badJob]);
 
-  const pulling: M = { ...caughtUp, pull: { kind: "pulling", since: 5, failures: 0 } };
-  expect(check(line("checking…", jobDebt), { now, jobs, model: pulling })).toStrictEqual([]);
+  // Long past the deadline, a pull carrying the end still counts; without one it's a problem.
+  const late = ended("done", SOCKET_DEADLINE_MS + 100);
+  const pulling: M = { ...quiet(), pull: { kind: "pulling", since: 5, failures: 0 } };
+  expect(check(line("checking…", jobDebt), { now, jobs: late, model: pulling })).toStrictEqual([]);
+  expect(check(line("checking…", jobDebt), { now, jobs: late, model: quiet() })).toStrictEqual([
+    badJob,
+  ]);
 });
 
 test("missing jobs and different kind/key never satisfy the debt", () => {
@@ -389,6 +409,12 @@ test("sync with no model, a quiet model, or only future retries is not underway"
       ...quiet(),
       push: { kind: "idle", nextAt: now, failures: 0 },
       commands: [pending(done(6))],
+    }),
+    // A parked command is never pushed again; only a pull's receipt settles it.
+    world({
+      ...quiet(),
+      push: { kind: "idle", nextAt: now, failures: 0 },
+      commands: [pending({ kind: "unknown", failure: "refused", parked: true })],
     }),
   ]) {
     expect(check(line("checking…", { sync: true }), w)).toStrictEqual([badSync]);

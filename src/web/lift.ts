@@ -40,9 +40,6 @@ export type Earlier<T> = {
 /** A copy lifted and rewritten; `lost` when the disk moved on first (another tab), so the load reads again. */
 export type Lifted<T> = { tables: T; history: History } | "lost" | undefined;
 
-/** Lifts an earlier release's copy: made by `lifting`, handed to `indexedReplica` as `lifts`. */
-export type Lifting = { readonly lift: <T>(earlier: Earlier<T>) => Promise<Lifted<T>> };
-
 const COMPLETE: History = { kind: "complete" };
 
 /**
@@ -152,22 +149,34 @@ async function rewrite<T>(earlier: Earlier<T>, tables: T, history: History): Pro
 }
 
 /**
+ * Lifts an earlier release's copy: made by `lifting`, handed to `indexedReplica` as `lifts`. A class with a private
+ * field, so nothing else passes for one: only it rewrites the copy and marks it lifted.
+ */
+export class Lifting {
+  readonly #lifts: Lifts;
+
+  constructor(lifts: Lifts) {
+    this.#lifts = lifts;
+  }
+
+  async lift<T>(earlier: Earlier<T>): Promise<Lifted<T>> {
+    const up = read(this.#lifts, earlier);
+
+    if (up === undefined || (up.partial && earlier.history === undefined)) {
+      return undefined;
+    }
+
+    const history = up.partial ? (earlier.history ?? COMPLETE) : COMPLETE;
+
+    return (await rewrite(earlier, up.tables, history)) ? { tables: up.tables, history } : "lost";
+  }
+}
+
+/**
  * By table, an earlier release's row as this one reads it. A lift may be handed any other release's row, a newer
  * one's too (a rollback): it parses the shapes it knows strictly and throws on others, which starts the copy over.
  * `lifting({})` keeps a copy across a release that only adds tables.
  */
 export function lifting(lifts: Lifts): Lifting {
-  return {
-    async lift<T>(earlier: Earlier<T>): Promise<Lifted<T>> {
-      const up = read(lifts, earlier);
-
-      if (up === undefined || (up.partial && earlier.history === undefined)) {
-        return undefined;
-      }
-
-      const history = up.partial ? (earlier.history ?? COMPLETE) : COMPLETE;
-
-      return (await rewrite(earlier, up.tables, history)) ? { tables: up.tables, history } : "lost";
-    },
-  };
+  return new Lifting(lifts);
 }

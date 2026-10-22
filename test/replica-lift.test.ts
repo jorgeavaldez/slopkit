@@ -11,7 +11,7 @@ import { array, boolean, nullable, number, object, string } from "../src/schema.
 import type { Infer, Schema } from "../src/schema.ts";
 import { createSync, table } from "../src/sync.ts";
 import type { Key, Pending, Replica } from "../src/sync.ts";
-import { lifting } from "../src/web/lift.ts";
+import { Lifting, lifting } from "../src/web/lift.ts";
 import { indexedReplica } from "../src/web/replica.ts";
 import { createRuntime } from "../src/web/runtime.ts";
 import type { RuntimeEnv } from "../src/web/runtime.ts";
@@ -659,7 +659,8 @@ test.each(["replica tables only", "a legacy store too"])(
     }
 
     const names: ("rows" | "notes")[] = ["rows"];
-    const options = { version, names };
+    // With lifts, so the copy starts over because it holds a table this release doesn't have.
+    const options = { version, names, lifts: {} };
     const loaded = await f.open(olderRow, options).port.load();
     expect(loaded.unreadable).toBe(legacy ? 1 : 0);
     expect(loaded.commands).toStrictEqual(waiting);
@@ -735,7 +736,7 @@ test("dropping a replica table without a version bump cannot turn its rows into 
   const f = fixture();
   await seed(f.open(olderRow));
   const names: ("rows" | "notes")[] = ["rows"];
-  const withoutTable = f.open(olderRow, { names });
+  const withoutTable = f.open(olderRow, { names, lifts: {} });
   const loaded = await withoutTable.port.load();
   expect(loaded.unreadable).toBe(0);
   expect(loaded.commands).toStrictEqual(waiting);
@@ -745,10 +746,10 @@ test("dropping a replica table without a version bump cannot turn its rows into 
   const db = await requested(f.factory.open("replica-upgrade"));
   const version = db.version + 1;
   db.close();
-  const later = await f.open(olderRow, { version, names }).port.load();
+  const later = await f.open(olderRow, { version, names, lifts: {} }).port.load();
   expect(later.unreadable).toBe(0);
   expect(later.commands).toStrictEqual(waiting);
-  const reopened = await f.open(olderRow, { version, names }).port.load();
+  const reopened = await f.open(olderRow, { version, names, lifts: {} }).port.load();
   expect(reopened.unreadable).toBe(0);
   expect(reopened.commands).toStrictEqual(waiting);
 });
@@ -772,4 +773,11 @@ test("a whole repair written from the lifted revision cannot settle its reset de
   expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
   expect(reopened).toMatchObject({ restart: "paged" });
   expect(reopened.commands).toStrictEqual(waiting);
+});
+
+test("only lifting makes lifts, so none skips the rewrite and the lifted mark", () => {
+  // @ts-expect-error a hand-made object isn't a Lifting: its private field can't be forged
+  const forged: Lifting = { lift: () => Promise.resolve(undefined) };
+  expect(lifting({})).toBeInstanceOf(Lifting);
+  expect(forged).not.toBeInstanceOf(Lifting);
 });

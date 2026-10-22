@@ -169,8 +169,13 @@ export type World = {
     key: string;
     state: "due" | "running" | "done" | "failed";
     dueAt: string;
-    /** When it last changed (`Job.updatedAt`): a finished job's end, which the page hears of only after a poke. */
+    /** When it last changed (`Job.updatedAt`): a finished job's end. */
     updatedAt?: string;
+    /**
+     * A finished job's end as the page's copy holds it: the revision of the row that shows it. Until the copy is
+     * there, a working line may still show the job (the poke is on its way, or a pull is bringing it).
+     */
+    revision?: number;
   }[];
   /** The page's sync model: its commands and its copy. */
   // oxlint-disable-next-line typescript/no-explicit-any -- any app's model: only the kit's own fields are read
@@ -231,24 +236,26 @@ function owedName(owed: Owed): string {
 }
 
 /**
- * A finished job the page can't have heard of yet: it ended within the socket's deadline (the poke may be on its way,
- * or the socket goes stale and the page polls), and the page's copy may be from before its end: no copy, one last
- * caught up before the job ended, or a pull under way.
+ * A finished job the page's copy doesn't hold yet (below its `revision`), while the page can't have heard of it: the
+ * poke may still be coming (it hasn't heard that revision, and the job ended within the socket's deadline), or a pull
+ * is under way to bring it. Without a revision, a finished job is never under way.
  */
-function unheard(job: { updatedAt?: string }, world: World): boolean {
+function unheard(job: { updatedAt?: string; revision?: number }, world: World): boolean {
+  const { model } = world;
   const end = job.updatedAt === undefined ? Number.NaN : Date.parse(job.updatedAt);
+  const recent = world.now - end < SOCKET_DEADLINE_MS;
 
-  if (!(world.now - end < SOCKET_DEADLINE_MS)) {
+  if (job.revision === undefined) {
     return false;
   }
 
-  const { model } = world;
+  if (model === undefined) {
+    return recent;
+  }
 
   return (
-    model === undefined ||
-    model.reconciledAt === null ||
-    model.reconciledAt < end ||
-    pullUnderWay(model, world.now)
+    model.replica.revision < job.revision &&
+    ((recent && model.target < job.revision) || pullUnderWay(model, world.now))
   );
 }
 
@@ -274,7 +281,7 @@ function owedUnderWay(owed: Owed, world: World): boolean {
 /**
  * A reached view's problems by the kit's rules: every line has text with no broken value; every screen keeps its parts
  * (`screenProblems`); and, given what is under way (`world`), every working line's owed work is: a job running or due
- * by now, or just finished before the page could have heard (`World.jobs`' `updatedAt`), or the page's sync work as
+ * by now, or just finished and not yet in the page's copy (`World.jobs`' `revision`), or the page's sync work as
  * the engine runs it (`slopkit/sync`'s `underWay`, the rule an app places its working lines by). Takes any value an
  * app's view returns and finds the kit's lines and screens in it. Run it on every view a test reaches, not only on
  * samples.

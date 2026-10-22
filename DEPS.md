@@ -29,12 +29,13 @@ seeded network's PRNG and scheduler.
 ## Budgets
 
 - **Kit client core**, gated by `pack:check` on the packed package: `schema`, `contract`, `api`, `sync`, `client`,
-  `machine`, `money`, `digest`, `states`, `web/replica` and `web/runtime`, minified and gzipped together, ≤ 17,222
-  bytes (17,222 measured; the paged first copy added 1,470, refused pushes and the bounded outbox 1,755, the sync
-  contract and the page's runtime 2,428, in place of each app's own, a working state's owed work 107, and when sync
-  work is under way, from the engine's own rule, 266).
-  `cron` and `web/lift` (an upgrade keeping the offline copy, about 520) are browser-safe but outside the core; an app
-  that ships one counts it in its own budget. The budget grows only with a new entry or guarantee, by its measured size.
+  `machine`, `money`, `digest`, `states`, `web/replica` and `web/runtime`, minified and gzipped together, ≤ 17,266
+  bytes (17,266 measured; the paged first copy added 1,470, refused pushes and the bounded outbox 1,755, the sync
+  contract and the page's runtime 2,428, in place of each app's own, a working state's owed work 107, a lifted copy's
+  mark and owed reset 468, and when sync work is under way, by the engine's own rule, 310).
+  `cron` and `web/lift` (lifting an earlier release's copy, about 520 on top of the core) are browser-safe but outside
+  the core; an app that ships one counts it in its own budget. The budget grows only with a new entry or guarantee, by
+  its measured size.
 - **Hello app** (preact, signals, and `sync`, `client`, `web/replica`, `schema`, `contract`, `states`): ≤ 17 KB gzip
   JS, gated by the app template once it exists.
 - **Every app**, by default: initial JS ≤ 25 KB gzip, CSS ≤ 4 KB gzip, service worker ≤ 2 KB gzip. An app may lower

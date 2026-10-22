@@ -21,7 +21,7 @@ import { build } from "esbuild";
  * The kit's client core (`DEPS.md`), minified and gzipped together: it grows only with a new entry or guarantee, by its
  * measured size. `cron` and `web/lift` are browser-safe but outside the core.
  */
-const BROWSER_BUDGET_GZIP_BYTES = 17_222;
+const BROWSER_BUDGET_GZIP_BYTES = 17_266;
 
 const BROWSER = [
   "schema",

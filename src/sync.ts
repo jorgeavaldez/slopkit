@@ -653,11 +653,22 @@ export function settled<T, S, C, O>(model: Model<T, S, C, O>, pending: Pending<C
 const blocked = (connection: Connection) =>
   connection.kind === "signed-out" || connection.kind === "incompatible";
 
-/** The link as the engine finds it at `now`: a live socket not heard from within its deadline is stale. */
-const linkAt = (model: Model<unknown, unknown, unknown, unknown>, now: number): Connection =>
-  model.connection.kind === "live" && now - model.socket.heardAt >= SOCKET_DEADLINE_MS
-    ? { kind: "stale" }
-    : model.connection;
+/**
+ * The model as the engine finds it at `now` (a tick): a live socket not heard from within its deadline is stale, and
+ * storage that didn't answer within its deadline no longer holds the page back.
+ */
+function asAt<T, S, C, O>(model: Model<T, S, C, O>, now: number): Model<T, S, C, O> {
+  const quiet =
+    model.connection.kind === "live" && now - model.socket.heardAt >= SOCKET_DEADLINE_MS;
+
+  const unanswered = model.boot.kind === "loading" && now - model.boot.since >= STORAGE_DEADLINE_MS;
+
+  return {
+    ...model,
+    ...(quiet ? { connection: { kind: "stale" } } : {}),
+    ...(unanswered ? { boot: { kind: "ready" } } : {}),
+  };
+}
 
 /**
  * Whether the engine starts a pull at `now` (one isn't in flight): the copy loaded, the page visible, the server not
@@ -715,12 +726,14 @@ function pushStarts(
  * app's job's, not counted here.
  */
 export function pullUnderWay<T, S, C, O>(model: Model<T, S, C, O>, now: number): boolean {
-  return model.pull.kind === "pulling" || pullStarts(model, now, linkAt(model, now), false);
+  const at = asAt(model, now);
+
+  return model.pull.kind === "pulling" || pullStarts(at, now, at.connection, false);
 }
 
 /** A push in flight, or one the engine sends at `now` if a command waits: the link up and no backoff pending. */
 export function pushUnderWay<T, S, C, O>(model: Model<T, S, C, O>, now: number): boolean {
-  return model.push.kind === "pushing" || pushStarts(model, now, linkAt(model, now));
+  return model.push.kind === "pushing" || pushStarts(model, now, asAt(model, now).connection);
 }
 
 /** What a working line can owe the page's sync: one command (any page's), or the copy itself. */
@@ -733,7 +746,7 @@ export type SyncOwed =
  * holds, and is placed otherwise (a command queued offline or in backoff waits; it doesn't send). A command: being kept
  * or sent; waiting to send and a push going or starting; answered or parked and a pull going or starting; never once
  * settled or not on the page. The copy: loading, writing, pushing, or a pull going or starting, or a push for a
- * command waiting.
+ * command waiting to send (a parked one waits on a pull).
  */
 export function underWay<T, S, C, O>(
   model: Model<T, S, C, O>,
@@ -760,7 +773,13 @@ export function underWay<T, S, C, O>(
       : pullUnderWay(model, now);
   }
 
-  const unsent = model.commands.some((each) => each.state.kind !== "done");
+  // Being kept, or waiting to send: a parked command is never pushed again, only settled by a pull.
+  const unsent = model.commands.some(
+    ({ state }) =>
+      state.kind === "saving" ||
+      state.kind === "queued" ||
+      (state.kind === "unknown" && state.parked !== true)
+  );
 
   return (
     model.boot.kind === "loading" ||

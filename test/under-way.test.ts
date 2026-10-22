@@ -22,7 +22,8 @@ function never(): never {
 function journey(messages: ((model: M) => Message)[]): M[] {
   // The session's self-check already done, so a pull is owed only by what the journey does.
   let model: M = { ...engine.initial(CLIENT, start), verify: { kind: "done", match: true } };
-  const reached: M[] = [];
+  // The page before its storage answers too: past the deadline the engine starts without it.
+  const reached: M[] = [model];
 
   for (const message of messages) {
     [model] = engine.update(model, message(model));
