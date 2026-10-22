@@ -85,6 +85,8 @@ const { problems } = replayProblems(update, { kind: "draft" }, messages, { view:
 const page = await openPage({ server, page: () => import("../src/web/main.tsx"), at: "2026-01-01T12:00:00Z", path: "/?note=a" });
 await page.press(/save/); // by accessible name; settles, then checks the view
 await page.reload(); // same device: IndexedDB, localStorage, sessionStorage and the address kept
+const laptop = page.device();
+await page.reload({ device: "new" }); // another device, its storage empty; `reload({ device: laptop })` goes back
 
 // the page calls it, and the server answers after checking the login, the request and the reply
 const sent = await call(save, { text: "hi" }); // { ok: true, value: { id } } or a typed failure

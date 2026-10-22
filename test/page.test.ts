@@ -383,6 +383,35 @@ test("a new device clears local and session drafts and IndexedDB without changin
   expect(p.text("identity")).toMatch(/^401:/);
 });
 
+test("a device's handle takes the page back to that device's storage, and on again to the other's", async () => {
+  const p = await open();
+  await p.type("local draft", "laptop text");
+  await p.press("send x");
+  const laptop = p.device();
+
+  await p.reload({ device: "new" });
+  expect(p.text("saved local draft")).toBe("");
+  await p.type("local draft", "phone text");
+  const phone = p.device();
+  expect(phone).not.toBe(laptop);
+
+  await p.reload({ device: laptop });
+  expect(p.device()).toBe(laptop);
+  expect(p.text("saved local draft")).toBe("laptop text");
+  expect(p.text("transactions")).toContain("x:9");
+
+  await p.reload({ device: phone });
+  expect(p.text("saved local draft")).toBe("phone text");
+});
+
+test("a device handle from another page is refused", async () => {
+  const first = await open();
+  const elsewhere = first.device();
+  await first.close();
+  const p = await open();
+  await expect(p.reload({ device: elsewhere })).rejects.toThrow(/another page's device/);
+});
+
 test("the driver's back follows a traversal the page made through browser history", async () => {
   const p = await open(undefined, "/items?item=a#details");
   await p.press("open item b");

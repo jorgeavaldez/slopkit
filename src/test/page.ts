@@ -103,9 +103,12 @@ export type Page = {
   lines: () => ReadLine[];
   /**
    * A new page load at the address the page is on: fresh modules and DOM; this device's storage (IndexedDB,
-   * localStorage, sessionStorage), or a new device's, empty.
+   * localStorage, sessionStorage), a new device's, empty, or an earlier device's (`device()`), as it was left. The
+   * session is the same on every device.
    */
-  reload: (options?: { device?: "same" | "new" }) => Promise<void>;
+  reload: (options?: { device?: "same" | "new" | Device }) => Promise<void>;
+  /** The device the page is on now: hand it to `reload` to come back to it, for a journey across two devices. */
+  device: () => Device;
   /** The page's address, absolute. */
   location: () => string;
   /** History back within the page (an entry it pushed): the address moves and the page hears popstate; then settles. */
@@ -117,6 +120,9 @@ export type Page = {
   readonly now: number;
   close: () => Promise<void>;
 };
+
+/** A device a page was on: its IndexedDB and Web Storage, as `Page.device()` hands it out. */
+export type Device = { readonly device: number };
 
 type Timer = {
   id: number;
@@ -498,6 +504,9 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
     let device = new IDBFactory();
     /** The device's Web Storage, kept across page loads as a browser keeps it. */
     let stored = { local: new Map<string, string>(), session: new Map<string, string>() };
+    /** Every device this page was on, by handle; the storage objects are the live ones, filled at each unload. */
+    let here: Device = { device: 1 };
+    const devices = new Map([[here, { device, stored }]]);
     let address = new URL(options.path ?? "/", base).href;
     /**
      * The tab's history, as a browser keeps it across a reload: each entry's address and state, and where the tab is.
@@ -1034,6 +1043,9 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
       location() {
         return window?.location.href ?? address;
       },
+      device() {
+        return here;
+      },
       async back() {
         const from = window?.location.href;
         let heard = false;
@@ -1053,11 +1065,22 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         }
       },
       async reload(reloading = {}) {
+        const to = reloading.device ?? "same";
+
+        if (typeof to === "object" && !devices.has(to)) {
+          throw new Error("openPage: reload({ device }) was handed another page's device");
+        }
+
         await unload();
 
-        if (reloading.device === "new") {
+        if (to === "new") {
           device = new IDBFactory();
           stored = { local: new Map(), session: new Map() };
+          here = { device: devices.size + 1 };
+          devices.set(here, { device, stored });
+        } else if (typeof to === "object") {
+          ({ device, stored } = devices.get(to) ?? { device, stored });
+          here = to;
         }
 
         await load();
