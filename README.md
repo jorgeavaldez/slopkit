@@ -209,6 +209,9 @@ const sync = syncHandlers({ api, store, ledger: store.ledger, log, server: (call
 await serveSync({ name: "notes", api, sync, home, config, env, log, page, assets: "dist/web" });
 ```
 
+`unpaged` and `everything` get the caller too, so a table only people may read (`caller.person`) comes back empty to
+a service login, in its pulls and its checksum alike.
+
 your outcome union must admit the kit's own answers (`failed` with `conflict` or `forbidden`, and `retired`): if it
 can't, `serveSync` doesn't compile. the page runs the same engine headless or in a browser:
 

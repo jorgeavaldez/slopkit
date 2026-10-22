@@ -129,10 +129,16 @@ export function syncHandlers<
   server: (caller: V) => S;
   /** The history: the table paged newest first (`slopkit/server/pull`), and its row key in the api. */
   history: HistoryOptions<R[H]> & { row: H };
-  /** The other row keys' rows changed after `since`, or every live row for 0. */
-  unpaged: (since: number) => { [Key in Exclude<keyof R, H>]: R[Key][] };
-  /** Every live row of every table (what a complete copy holds), for a verifying pull's checksum. */
-  everything: () => { [Key in keyof R]: readonly R[Key][] };
+  /**
+   * The other row keys' rows changed after `since`, or every live row for 0, as this caller may read them (a table
+   * only people see is empty for a service).
+   */
+  unpaged: (since: number, caller: V) => { [Key in Exclude<keyof R, H>]: R[Key][] };
+  /**
+   * Every live row of every table this caller may read (what its complete copy holds), for a verifying pull's
+   * checksum: the same rows `unpaged(0, caller)` gives.
+   */
+  everything: (caller: V) => { [Key in keyof R]: readonly R[Key][] };
   /** The history rows (by key) a receipt names: they come in the reply that carries it. */
   names: (kept: K) => readonly (string | number)[];
   limits: PullLimits;
@@ -179,7 +185,7 @@ export function syncHandlers<
       revision: () => store.revision(),
       known: (since) => store.known(since),
       paged,
-      unpaged: options.unpaged,
+      unpaged: (since) => options.unpaged(since, caller),
       receipts: {
         read: (ask): Pulled[] =>
           ask.commands === undefined
@@ -217,7 +223,7 @@ export function syncHandlers<
 
     const { reply } = pulls.pull(request, caller);
     const partial = reply.page !== undefined && reply.page.next !== null;
-    const all = request.verify === true && !partial ? options.everything() : undefined;
+    const all = request.verify === true && !partial ? options.everything(caller) : undefined;
 
     store.served(reply.revision);
 

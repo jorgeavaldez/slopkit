@@ -13,6 +13,7 @@ import type { Schema } from "../src/schema.ts";
 import { array, literal, number, object, string, variant } from "../src/schema.ts";
 import type { KitOutcome as ServerKitOutcome } from "../src/server/sync.ts";
 import { KIT_ANSWERS, pokes, serveSync, syncHandlers, syncRoutes } from "../src/server/sync.ts";
+import type { Caller } from "../src/server/web.ts";
 import { api, AGENT, CLIENT, fixture, PERSON, row, command, serverSchema } from "./sync-fixture.ts";
 
 function nextMessage(socket: WebSocket) {
@@ -968,6 +969,52 @@ test("routes also refuse a schema whose retired variant rejects the kit's retire
     });
 
     expect(() => syncRoutes(constrained, { ...f.sync, page: () => {} })).toThrow(Error);
+  } finally {
+    await f.close();
+  }
+});
+
+test("rows only a person may read stay out of a service's pull, deltas and checksum, by caller", async () => {
+  const f = await fixture();
+
+  try {
+    const people = (caller: { person: boolean }, rows: ReturnType<typeof f.store.rows>) =>
+      caller.person ? rows : [];
+
+    const sync = syncHandlers({
+      ...f.handlerOptions,
+      unpaged: (since: number, caller: Caller) => ({
+        settings: people(caller, f.store.rows("settings", since)),
+      }),
+      everything: (caller: Caller) => ({
+        history: f.store.rows("history"),
+        settings: people(caller, f.store.rows("settings")),
+      }),
+    });
+
+    f.store.put("secret", 1, "settings");
+    const dataset = f.store.dataset();
+
+    expect((await sync.pull(pull(null), PERSON)).settings.map((r) => r.id)).toStrictEqual([
+      "secret",
+    ]);
+    expect((await sync.pull(pull(null), AGENT)).settings).toStrictEqual([]);
+    expect((await sync.pull({ ...pull(null), page: null }, AGENT)).settings).toStrictEqual([]);
+
+    const since = f.store.revision();
+    f.store.put("later", 2, "settings");
+    expect((await sync.pull(pull(dataset, since), AGENT)).settings).toStrictEqual([]);
+    expect(
+      (await sync.pull({ ...pull(dataset, since), page: null }, AGENT)).settings
+    ).toStrictEqual([]);
+    expect((await sync.pull(pull(dataset, since), PERSON)).settings.map((r) => r.id)).toStrictEqual(
+      ["later"]
+    );
+
+    // SHA256('[[],[]]'), hand-computed independently of slopkit/digest: what the service's copy holds.
+    const emptyHash = "643d5437104296e21d906ecb15b2c96ad278f20cfc4af53b12bb6069bd853726";
+    expect((await sync.pull({ ...pull(null), verify: true }, AGENT)).checksum).toBe(emptyHash);
+    expect((await sync.pull({ ...pull(null), verify: true }, PERSON)).checksum).not.toBe(emptyHash);
   } finally {
     await f.close();
   }
