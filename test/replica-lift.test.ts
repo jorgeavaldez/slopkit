@@ -321,30 +321,33 @@ test("an older reader starts over on a newer release's rows and keeps its outbox
   expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
 });
 
-async function network() {
+async function network(options: { revision?: number; rows?: Row[]; notes?: Row[] } = {}) {
   const pulls: { since: number; dataset: string | null }[] = [];
   const pushes: { since: number; commands: { id: number }[] }[] = [];
   let online = false;
+  const revision = options.revision ?? 9;
 
-  const rows: Row[] = [
-    { id: "b", value: 200, revision: 9, deleted: false, labels: ["server"] },
-    { id: "c", value: 300, revision: 9, deleted: false, labels: ["new"] },
+  const rows: Row[] = options.rows ?? [
+    { id: "b", value: 200, revision, deleted: false, labels: ["server"] },
+    { id: "c", value: 300, revision, deleted: false, labels: ["new"] },
   ];
 
-  const notes: Row[] = [
-    { id: "m", value: 400, revision: 9, deleted: false, labels: ["server-note"] },
+  const notes: Row[] = options.notes ?? [
+    { id: "m", value: 400, revision, deleted: false, labels: ["server-note"] },
   ];
 
   // oxlint-disable-next-line typescript/no-misused-promises, typescript/strict-void-return -- the loopback HTTP server owns this asynchronous request handler
   const server = createServer(async (request, response) => {
     const url = new URL(request.url ?? "/", "http://fixture");
+    let since: number | undefined;
 
     if (url.pathname === "/api/pull") {
-      pulls.push(
-        object({ since: number(), dataset: nullable(string()) }).parse(
-          JSON.parse(url.searchParams.get("q") ?? "null")
-        )
+      const pull = object({ since: number(), dataset: nullable(string()) }).parse(
+        JSON.parse(url.searchParams.get("q") ?? "null")
       );
+
+      pulls.push(pull);
+      since = pull.since;
     }
 
     if (url.pathname === "/api/push") {
@@ -370,10 +373,10 @@ async function network() {
         online && url.pathname === "/api/pull"
           ? {
               dataset: "dataset-a",
-              revision: 9,
-              reset: true,
-              rows,
-              notes,
+              revision,
+              reset: since === 0,
+              rows: since === revision ? [] : rows,
+              notes: since === revision ? [] : notes,
               server: { version: "2.0.0" },
               checksum: createHash("sha256")
                 .update(JSON.stringify([rows, notes]))
@@ -667,3 +670,94 @@ test.each(["replica tables only", "a legacy store too"])(
     }
   }
 );
+
+test("a reset at the lifted revision replaces the disk copy and the next online open pulls a delta", async () => {
+  const f = fixture();
+
+  const rows: Row[] = [
+    { id: "a", value: 10, revision: 6, deleted: false, labels: ["server-a"] },
+    { id: "b", value: 20, revision: 7, deleted: false, labels: ["server-b"] },
+  ];
+
+  const notes: Row[] = [
+    { id: "n", value: 30, revision: 7, deleted: false, labels: ["server-note"] },
+  ];
+
+  const n = await network({ revision: 7, rows, notes });
+  await seed(f.open(olderRow));
+  const lifted = await f.open(currentRow, { lifts }).port.load();
+  expectRows(lifted.replica, liftedRows, liftedNotes);
+  expect(lifted.replica.revision).toBe(7);
+  expect(lifted).toMatchObject({ restart: "paged" });
+  n.connect();
+  const first = createRuntime(runtimeOptions(f, n.host));
+  onTestFinished(() => first.stop());
+  first.start();
+  await first.settle();
+  expect(n.pulls[0]).toStrictEqual({ dataset: "dataset-a", since: 0 });
+  expectRows(first.model().replica, rows, notes);
+  expect(first.model().replica.revision).toBe(7);
+  first.stop();
+  const disk = await f.open(currentRow).port.load();
+  expectRows(disk.replica, rows, notes);
+  expect(disk.replica.revision).toBe(7);
+  expect("restart" in disk ? disk.restart : undefined).toBeUndefined();
+  const pullsBefore = n.pulls.length;
+  const second = createRuntime(runtimeOptions(f, n.host));
+  onTestFinished(() => second.stop());
+  second.start();
+  await second.settle();
+  expect(n.pulls[pullsBefore]).toStrictEqual({ dataset: "dataset-a", since: 7 });
+  expectRows(second.model().replica, rows, notes);
+  const reopened = await f.open(currentRow).port.load();
+  expectRows(reopened.replica, rows, notes);
+  expect("restart" in reopened ? reopened.restart : undefined).toBeUndefined();
+  expect(reopened.commands.map((intent) => [intent.id, intent.since])).toStrictEqual([
+    [1, 5],
+    [2, 7],
+    [3, 6],
+  ]);
+});
+
+test("dropping a replica table without a version bump cannot turn its rows into commands at a later bump", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow));
+  const names: ("rows" | "notes")[] = ["rows"];
+  const withoutTable = f.open(olderRow, { names });
+  const loaded = await withoutTable.port.load();
+  expect(loaded.unreadable).toBe(0);
+  expect(loaded.commands).toStrictEqual(waiting);
+  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0 });
+  await withoutTable.port.keep(waiting[0]);
+  f.close();
+  const db = await requested(f.factory.open("replica-upgrade"));
+  const version = db.version + 1;
+  db.close();
+  const later = await f.open(olderRow, { version, names }).port.load();
+  expect(later.unreadable).toBe(0);
+  expect(later.commands).toStrictEqual(waiting);
+  const reopened = await f.open(olderRow, { version, names }).port.load();
+  expect(reopened.unreadable).toBe(0);
+  expect(reopened.commands).toStrictEqual(waiting);
+});
+
+test("a whole repair written from the lifted revision cannot settle its reset debt", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow));
+  const current = f.open(currentRow, { lifts });
+  const lifted = await current.port.load();
+  expect(lifted.replica.revision).toBe(7);
+  expect(lifted).toMatchObject({ restart: "paged" });
+  await current.port.commit({
+    replica: { ...lifted.replica, server: { version: "2.0.0" } },
+    reset: true,
+    base: 7,
+    replaces: "dataset-a",
+    ops: [],
+  });
+  const reopened = await f.open(currentRow).port.load();
+  expectRows(reopened.replica, liftedRows, liftedNotes);
+  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 7, server: null });
+  expect(reopened).toMatchObject({ restart: "paged" });
+  expect(reopened.commands).toStrictEqual(waiting);
+});

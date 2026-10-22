@@ -538,3 +538,52 @@ test.each(inFlightSync)(
     }
   }
 );
+
+const pullReasons: [string, (model: M) => M][] = [
+  ["a target ahead", (model) => ({ ...model, target: 6 })],
+  [
+    "partial history",
+    (model) => ({
+      ...model,
+      replica: {
+        ...model.replica,
+        history: { kind: "partial", next: "older", through: "today", held: 2, total: 10 },
+      },
+    }),
+  ],
+  ["a pending restart", (model) => ({ ...model, restart: "paged" })],
+];
+
+const pullRetries = [
+  ["no failed attempt", 0, now + 1000, true],
+  ["a failed attempt in backoff", 1, now + 1000, false],
+  ["a retry due now", 1, now, true],
+  ["an overdue retry", 2, now - 1, true],
+] as const;
+
+const pullCases = pullReasons.flatMap(([reason, change]) =>
+  pullRetries.map(
+    ([retry, failures, nextAt, underway]) =>
+      [reason, retry, change, failures, nextAt, underway] as const
+  )
+);
+
+test.each(pullCases)(
+  "%s with %s only justifies sync and answered commands when the pull can start",
+  (_reason, _retry, change, failures, nextAt, underway) => {
+    const model: M = {
+      ...change(quiet()),
+      visible: true,
+      connection: { kind: "offline", failure: "network down" },
+      commands: [pending(done(6))],
+      pull: { kind: "idle", nextAt, failures },
+    };
+
+    expect(check(line("checking…", { sync: true }), world(model))).toStrictEqual(
+      underway ? [] : [badSync]
+    );
+    expect(check(line("checking…", commandDebt), world(model))).toStrictEqual(
+      underway ? [] : [badCommand]
+    );
+  }
+);

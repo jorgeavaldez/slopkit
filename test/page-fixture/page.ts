@@ -66,8 +66,13 @@ let loop = false;
 let interval: ReturnType<typeof setInterval> | undefined;
 let address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 let popstates = 0;
+let poppedState = "not traversed";
 let localDraft = window.localStorage.getItem("local-draft") ?? "";
 let sessionDraft = window.sessionStorage.getItem("session-draft") ?? "";
+let exitDraft = window.localStorage.getItem("exit-draft") ?? "";
+const savedExitDraft = exitDraft;
+const savedExitEvents = window.localStorage.getItem("exit-events") ?? "";
+const leaving: string[] = [];
 const root = document.querySelector("#app");
 
 if (!root) {
@@ -81,8 +86,8 @@ function send(id: string, value: number) {
 }
 
 function paint() {
-  function navigate(path: string) {
-    window.history.pushState({}, "", path);
+  function navigate(path: string, state: string | null = null) {
+    window.history.pushState(state, "", path);
     address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     paint();
   }
@@ -94,6 +99,37 @@ function paint() {
       h("button", { "aria-label": "send x", onClick: () => send("x", 9) }, "×"),
       h("button", { onClick: () => navigate("/items?item=b#details") }, "open item b"),
       h("button", { onClick: () => navigate("/items?item=c#details") }, "open item c"),
+      h(
+        "button",
+        { onClick: () => navigate("/items?item=b#details", "item-b-state") },
+        "open item b with state"
+      ),
+      h("button", { onClick: () => window.history.back() }, "page back"),
+      h(
+        "button",
+        {
+          onClick: () => {
+            window.location.hash = "x";
+            address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+            paint();
+          },
+        },
+        "change fragment"
+      ),
+      h("input", {
+        "aria-label": "exit draft",
+        value: exitDraft,
+        onInput: (event: Event) => {
+          const target = event.currentTarget;
+
+          if (!(target instanceof HTMLInputElement)) {
+            throw new Error("not an input");
+          }
+
+          exitDraft = target.value;
+          paint();
+        },
+      }),
       h("input", {
         "aria-label": "local draft",
         value: localDraft,
@@ -131,6 +167,10 @@ function paint() {
         new URL(address, window.location.origin).searchParams.get("item") ?? "none"
       ),
       h("output", { "aria-label": "popstate count" }, String(popstates)),
+      h("output", { "aria-label": "popstate state" }, poppedState),
+      h("output", { "aria-label": "history state" }, JSON.stringify(window.history.state)),
+      h("output", { "aria-label": "saved exit draft" }, savedExitDraft),
+      h("output", { "aria-label": "saved exit events" }, savedExitEvents),
       h("output", { "aria-label": "saved local draft" }, localDraft),
       h("output", { "aria-label": "saved session draft" }, sessionDraft),
       h("button", { onClick: () => send("long", 2) }, "send x twice"),
@@ -313,10 +353,20 @@ function paint() {
 
 runtime.subscribe(paint);
 
-window.addEventListener("pagehide", () => runtime.stop());
+document.addEventListener("visibilitychange", () => {
+  leaving.push(`visibility:${document.visibilityState}`);
+});
 
-window.addEventListener("popstate", () => {
+window.addEventListener("pagehide", () => {
+  leaving.push("pagehide");
+  window.localStorage.setItem("exit-draft", exitDraft);
+  window.localStorage.setItem("exit-events", leaving.join(" "));
+  runtime.stop();
+});
+
+window.addEventListener("popstate", (event: PopStateEvent) => {
   popstates++;
+  poppedState = JSON.stringify(event.state) ?? "undefined";
   address = `${window.location.pathname}${window.location.search}${window.location.hash}`;
   paint();
 });

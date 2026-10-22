@@ -394,3 +394,61 @@ test("a new device clears local and session drafts and IndexedDB without changin
   await p.press("probe identity");
   expect(p.text("identity")).toMatch(/^401:/);
 });
+
+test("the driver's back follows a traversal the page made through browser history", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("open item b");
+  await p.press("open item c");
+  await p.press("page back");
+  expect(p.text("open item")).toBe("b");
+  expect(p.text("popstate count")).toBe("1");
+  await back(p);
+  expect(p.text("open item")).toBe("a");
+  expect(p.text("popstate count")).toBe("2");
+  expect(location(p)).toBe(`${server.url}/items?item=a#details`);
+});
+
+test("history back restores a string state unchanged in history and popstate", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("open item b with state");
+  expect(p.text("history state")).toBe('"item-b-state"');
+  await p.press("open item c");
+  await back(p);
+  expect(p.text("open item")).toBe("b");
+  expect(p.text("history state")).toBe('"item-b-state"');
+  expect(p.text("popstate state")).toBe('"item-b-state"');
+  expect(p.text("popstate count")).toBe("1");
+});
+
+test("a fragment assignment creates a history entry that back can leave", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("change fragment");
+  expect(p.text("page address")).toBe("/items?item=a#x");
+  expect(location(p)).toBe(`${server.url}/items?item=a#x`);
+  const popsBefore = Number(p.text("popstate count"));
+  await back(p);
+  expect(p.text("page address")).toBe("/items?item=a#details");
+  expect(location(p)).toBe(`${server.url}/items?item=a#details`);
+  expect(Number(p.text("popstate count"))).toBe(popsBefore + 1);
+});
+
+test("back after a pushed address and a reload returns to the earlier page address", async () => {
+  const p = await open(undefined, "/items?item=a#details");
+  await p.press("open item b");
+  await p.reload();
+  expect(p.text("page address")).toBe("/items?item=b#details");
+  await back(p);
+  expect(p.text("open item")).toBe("a");
+  expect(p.text("page address")).toBe("/items?item=a#details");
+  expect(location(p)).toBe(`${server.url}/items?item=a#details`);
+  expect(p.text("popstate count")).toBe("1");
+});
+
+test("reload hides the old page and fires pagehide before keeping its last draft", async () => {
+  const p = await open();
+  await p.type("exit draft", "saved while leaving");
+  expect(p.text("saved exit draft")).toBe("");
+  await p.reload();
+  expect(p.text("saved exit draft")).toBe("saved while leaving");
+  expect(p.text("saved exit events")).toBe("visibility:hidden pagehide");
+});
