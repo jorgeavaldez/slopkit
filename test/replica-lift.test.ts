@@ -1,0 +1,497 @@
+import { createHash } from "node:crypto";
+import { once } from "node:events";
+import { createServer } from "node:http";
+
+import { IDBFactory } from "fake-indexeddb";
+import { expect, onTestFinished, test } from "vitest";
+
+import { syncApi } from "../src/api.ts";
+import { Replaced } from "../src/client.ts";
+import { array, boolean, nullable, number, object, string } from "../src/schema.ts";
+import type { Infer, Schema } from "../src/schema.ts";
+import { createSync, table } from "../src/sync.ts";
+import type { Key, Pending, Replica } from "../src/sync.ts";
+import { indexedReplica } from "../src/web/replica.ts";
+import { createRuntime } from "../src/web/runtime.ts";
+import type { RuntimeEnv } from "../src/web/runtime.ts";
+import { command, outcome, pending, serverSchema } from "./sync-fixture.ts";
+import type { Command, Outcome } from "./sync-fixture.ts";
+
+const fields = {
+  id: string(),
+  value: number({ integer: true }),
+  deleted: boolean(),
+  revision: number({ integer: true, min: 0 }),
+};
+
+const olderRow = object(fields, { strict: true });
+const currentRow = object({ ...fields, labels: array(string()) }, { strict: true });
+
+type OlderRow = Infer<typeof olderRow>;
+
+type Row = Infer<typeof currentRow>;
+
+type Server = Infer<typeof serverSchema>;
+
+type Tables<R> = { rows: ReadonlyMap<Key, R>; notes: ReadonlyMap<Key, R> };
+
+type Patch<R> = { rows: R[]; notes: R[] };
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters, anti-slop/no-unknown-returns -- lifts are the boundary from a previous release's stored row to this release's row
+type Lift = (row: unknown) => unknown;
+
+const waiting: [Pending<Command, Outcome>, Pending<Command, Outcome>, Pending<Command, Outcome>] = [
+  {
+    client: "page_before",
+    id: 1,
+    dataset: "dataset-a",
+    since: 5,
+    command: { name: "put", id: "a", value: 25 },
+    at: 1,
+    state: { kind: "queued" },
+  },
+  {
+    client: "page_before",
+    id: 2,
+    dataset: "dataset-a",
+    since: 7,
+    command: { name: "put", id: "b", value: 35 },
+    at: 2,
+    state: { kind: "queued" },
+  },
+  {
+    client: "page_before",
+    id: 3,
+    dataset: "dataset-a",
+    since: 6,
+    command: { name: "remote", id: "c", value: 45 },
+    at: 3,
+    state: { kind: "unknown", failure: "reply lost", parked: true },
+  },
+];
+
+const oldRows: OlderRow[] = [
+  { id: "a", value: 10, revision: 6, deleted: false },
+  { id: "b", value: 20, revision: 7, deleted: false },
+];
+
+const oldNotes: OlderRow[] = [{ id: "n", value: 30, revision: 7, deleted: false }];
+
+const liftedRows: Row[] = [
+  { id: "a", value: 10, revision: 6, deleted: false, labels: [] },
+  { id: "b", value: 20, revision: 7, deleted: false, labels: [] },
+];
+
+const liftedNotes: Row[] = [{ id: "n", value: 30, revision: 7, deleted: false, labels: ["note"] }];
+
+const lifts: Record<"rows" | "notes", Lift> = {
+  rows: (raw) => ({ ...olderRow.parse(raw), labels: [] }),
+  notes: (raw) => ({ ...olderRow.parse(raw), labels: ["note"] }),
+};
+
+function fixture() {
+  const factory = new IDBFactory();
+  const connections = new Set<IDBDatabase>();
+
+  const close = () => {
+    for (const connection of connections) {
+      connection.close();
+    }
+  };
+
+  onTestFinished(close);
+
+  function open<R extends OlderRow>(
+    schema: Schema<R>,
+    options: { version?: number; names?: ("rows" | "notes")[]; lifts?: Partial<typeof lifts> } = {}
+  ) {
+    const empty: Tables<R> = { rows: new Map(), notes: new Map() };
+
+    const tables = (options.names ?? ["rows", "notes"]).map((name) =>
+      table<Tables<R>, Patch<R>, R>({
+        name,
+        schema,
+        rows: (patch) => patch[name],
+        key: (row) => row.id,
+        gone: (row) => row.deleted,
+        get: (all) => all[name],
+        set: (all, rows) => ({ ...all, [name]: rows }),
+      })
+    );
+
+    const settings = {
+      factory,
+      name: "replica-upgrade",
+      version: options.version ?? 1,
+      tables,
+      empty,
+      server: serverSchema,
+      pending,
+      ...(options.lifts === undefined ? {} : { lifts: options.lifts }),
+      interfere: (_what: "commit" | "keep" | "drop", transaction: IDBTransaction) => {
+        connections.add(transaction.db);
+      },
+    };
+
+    const port = indexedReplica<Tables<R>, Patch<R>, Server, Command, Outcome>(settings);
+
+    return { port, tables, empty };
+  }
+
+  return { factory, open, close };
+}
+
+function copy<R extends OlderRow>(rows: R[], notes: R[], revision = 7): Replica<Tables<R>, Server> {
+  const keys = (items: R[]) => new Map(items.map((row) => [row.id, row]));
+
+  return {
+    dataset: "dataset-a",
+    revision,
+    server: { version: "1.0.0" },
+    tables: { rows: keys(rows), notes: keys(notes) },
+  };
+}
+
+function reset<T, S>(replica: Replica<T, S>) {
+  return { replica, reset: true, base: 0, replaces: null, ops: [] };
+}
+
+async function seed(
+  current: ReturnType<ReturnType<typeof fixture>["open"]>,
+  replica: Replica<Tables<OlderRow>, Server> = copy(oldRows, oldNotes)
+) {
+  await current.port.load();
+  await current.port.commit(reset(replica));
+
+  for (const intent of waiting) {
+    await current.port.keep(intent);
+  }
+}
+
+function expectRows<R>(replica: Replica<Tables<R>, Server>, rows: R[], notes: R[]) {
+  expect([...replica.tables.rows.values()]).toStrictEqual(rows);
+  expect([...replica.tables.notes.values()]).toStrictEqual(notes);
+}
+
+test("an offline upgrade lifts every table, keeps no revision claim, and durably writes the current rows", async () => {
+  const f = fixture();
+  const stale = f.open(olderRow);
+  await stale.port.load();
+  await stale.port.forget();
+  const before = f.open(olderRow);
+  await seed(before);
+  const after = f.open(currentRow, { lifts });
+  const loaded = await after.port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, liftedRows, liftedNotes);
+  expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 0, server: null });
+
+  // Another open has no lifts: both the rows and their current shapes must already be on disk.
+  const reopened = await f.open(currentRow).port.load();
+  expectRows(reopened.replica, liftedRows, liftedNotes);
+  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 0, server: null });
+  expect(reopened.commands).toStrictEqual(waiting);
+
+  // An upgrade does not move the forget fence in either direction.
+  await expect(stale.port.keep({ ...waiting[0], id: 4 })).rejects.toBeInstanceOf(Replaced);
+  await expect(before.port.keep({ ...waiting[0], id: 4 })).resolves.toBeUndefined();
+});
+
+test.each(["rows", "notes"] as const)(
+  "an unreadable lifted row in %s discards the entire copy, not just that table",
+  async (name) => {
+    const f = fixture();
+    await seed(f.open(olderRow));
+
+    const invalid: Lift = (raw) => {
+      const row = olderRow.parse(raw);
+
+      return row.id === "b" || row.id === "n" ? { ...row, labels: [42] } : { ...row, labels: [] };
+    };
+
+    const loaded = await f.open(currentRow, { lifts: { ...lifts, [name]: invalid } }).port.load();
+    expect(loaded.commands).toStrictEqual(waiting);
+    expectRows(loaded.replica, [], []);
+    expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
+    const unchanged = await f.open(olderRow).port.load();
+    expectRows(unchanged.replica, oldRows, oldNotes);
+    const reopened = await f.open(currentRow).port.load();
+    expectRows(reopened.replica, [], []);
+    expect(reopened.commands).toStrictEqual(waiting);
+  }
+);
+
+test("a changed table without a lift cannot leave a different table lifted", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow));
+  const loaded = await f.open(currentRow, { lifts: { rows: lifts.rows } }).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, [], []);
+  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
+});
+
+test("lifting a partial copy keeps its rows and partial coverage without claiming their revision", async () => {
+  const f = fixture();
+
+  const history = {
+    kind: "partial",
+    next: "older:a:10",
+    through: "10",
+    held: 2,
+    total: 9,
+  } as const;
+
+  await seed(f.open(olderRow), { ...copy(oldRows, oldNotes), history });
+  const loaded = await f.open(currentRow, { lifts }).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, liftedRows, liftedNotes);
+  expect(loaded.replica).toMatchObject({
+    dataset: "dataset-a",
+    revision: 0,
+    server: null,
+    history,
+  });
+  const reopened = await f.open(currentRow).port.load();
+  expectRows(reopened.replica, liftedRows, liftedNotes);
+  expect(reopened.replica).toMatchObject({ revision: 0, history });
+  expect(reopened.commands).toStrictEqual(waiting);
+});
+
+test("adding a table keeps liftable old rows and opens the new table empty", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow, { names: ["rows"] }), copy(oldRows, []));
+  f.close();
+  const identity: Lift = (raw) => olderRow.parse(raw);
+
+  const options = { version: 2, lifts: { rows: identity } };
+  const loaded = await f.open(olderRow, options).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, oldRows, []);
+  expect(loaded.replica).toMatchObject({ dataset: "dataset-a", revision: 0, server: null });
+  const reopened = await f.open(olderRow, { version: 2 }).port.load();
+  expectRows(reopened.replica, oldRows, []);
+  expect(reopened.replica).toMatchObject({ dataset: "dataset-a", revision: 0 });
+  expect(reopened.commands).toStrictEqual(waiting);
+});
+
+test("without lifts a changed row shape starts over and keeps waiting commands at their own revisions", async () => {
+  const f = fixture();
+  await seed(f.open(olderRow));
+  const loaded = await f.open(currentRow).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, [], []);
+  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
+});
+
+test("an older reader starts over on a newer release's rows and keeps its outbox", async () => {
+  const f = fixture();
+  const newer = f.open(currentRow);
+  await newer.port.load();
+  await newer.port.commit(reset(copy(liftedRows, liftedNotes)));
+
+  for (const intent of waiting) {
+    await newer.port.keep(intent);
+  }
+
+  const loaded = await f.open(olderRow).port.load();
+  expect(loaded.commands).toStrictEqual(waiting);
+  expectRows(loaded.replica, [], []);
+  expect(loaded.replica).toMatchObject({ dataset: null, revision: 0, server: null });
+});
+
+async function network() {
+  const pulls: { since: number; dataset: string | null }[] = [];
+  const pushes: { since: number; commands: { id: number }[] }[] = [];
+  let online = false;
+
+  const rows: Row[] = [
+    { id: "b", value: 200, revision: 9, deleted: false, labels: ["server"] },
+    { id: "c", value: 300, revision: 9, deleted: false, labels: ["new"] },
+  ];
+
+  const notes: Row[] = [
+    { id: "m", value: 400, revision: 9, deleted: false, labels: ["server-note"] },
+  ];
+
+  // oxlint-disable-next-line typescript/no-misused-promises, typescript/strict-void-return -- the loopback HTTP server owns this asynchronous request handler
+  const server = createServer(async (request, response) => {
+    const url = new URL(request.url ?? "/", "http://fixture");
+
+    if (url.pathname === "/api/pull") {
+      pulls.push(
+        object({ since: number(), dataset: nullable(string()) }).parse(
+          JSON.parse(url.searchParams.get("q") ?? "null")
+        )
+      );
+    }
+
+    if (url.pathname === "/api/push") {
+      const chunks: string[] = [];
+      request.setEncoding("utf-8");
+
+      for await (const chunk of request) {
+        chunks.push(string().parse(chunk));
+      }
+
+      pushes.push(
+        object({ since: number(), commands: array(object({ id: number() })) }).parse(
+          JSON.parse(chunks.join(""))
+        )
+      );
+    }
+
+    response.writeHead(online && url.pathname === "/api/pull" ? 200 : 503, {
+      "content-type": "application/json",
+    });
+    response.end(
+      JSON.stringify(
+        online && url.pathname === "/api/pull"
+          ? {
+              dataset: "dataset-a",
+              revision: 9,
+              reset: true,
+              rows,
+              notes,
+              server: { version: "2.0.0" },
+              checksum: createHash("sha256")
+                .update(JSON.stringify([rows, notes]))
+                .digest("hex"),
+              commands: [],
+            }
+          : { kind: "unavailable", message: "connection unavailable" }
+      )
+    );
+  });
+
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  onTestFinished(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error ? reject(error) : resolve()));
+    });
+  });
+  const address = server.address();
+
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Node's listen address is a TCP address or a pipe path at this I/O boundary
+  if (address === null || typeof address === "string") {
+    throw new Error("missing loopback address");
+  }
+
+  return {
+    pulls,
+    pushes,
+    rows,
+    notes,
+    host: `127.0.0.1:${address.port}`,
+    connect: () => {
+      online = true;
+    },
+  };
+}
+
+test.each(["older rows", "already lifted rows"])(
+  "the runtime opens %s offline, pulls since zero, and replaces the copy whole",
+  async (storedRows) => {
+    const f = fixture();
+    const n = await network();
+
+    if (storedRows === "older rows") {
+      await seed(f.open(olderRow));
+    } else {
+      const before = f.open(currentRow);
+      await before.port.load();
+      await before.port.commit(
+        reset<Tables<Row>, Server>({ ...copy(liftedRows, liftedNotes, 0), server: null })
+      );
+
+      for (const intent of waiting) {
+        await before.port.keep(intent);
+      }
+    }
+
+    const { tables, empty } = f.open(currentRow);
+
+    const api = syncApi({
+      rows: { rows: currentRow, notes: currentRow },
+      server: serverSchema,
+      command,
+      outcome,
+    });
+
+    const sync = createSync<Tables<Row>, Patch<Row>, Server, Command, Outcome>({
+      tables,
+      empty,
+      onlineOnly: () => false,
+      resolved: () => false,
+      refused: (_command, message) => ({ kind: "failed", reason: "fixture", message }),
+    });
+
+    const env: RuntimeEnv = {
+      indexedDB: f.factory,
+      fetch,
+      socket: () => ({ onopen: null, onmessage: null, onclose: null, close: () => {} }),
+      location: { protocol: "http:", host: n.host, reload: () => {} },
+      document: {
+        visibilityState: "visible",
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      },
+      persist: () => Promise.resolve(false),
+      now: () => 1000,
+      monotonic: () => 1000,
+      setTimeout: () => () => {},
+      setInterval: () => () => {},
+      random: (count) => new Uint8Array(count).fill(1),
+    };
+
+    const options = {
+      name: "replica-upgrade",
+      sync,
+      api,
+      replica: { version: 1, tables, empty, pending, lifts },
+      env,
+    };
+
+    const offline = createRuntime(options);
+    onTestFinished(() => offline.stop());
+    offline.start();
+    await offline.settle();
+    expectRows(offline.model().replica, liftedRows, liftedNotes);
+    expect(offline.model().replica).toMatchObject({
+      dataset: "dataset-a",
+      revision: 0,
+      server: null,
+    });
+    expect(n.pulls[0]).toStrictEqual({ since: 0, dataset: "dataset-a" });
+    offline.stop();
+    n.connect();
+    const online = createRuntime({ ...options, replica: { version: 1, tables, empty, pending } });
+    onTestFinished(() => online.stop());
+    const firstOnlinePull = n.pulls.length;
+    const firstOnlinePush = n.pushes.length;
+    online.start();
+    await online.settle();
+    expect(n.pulls[firstOnlinePull]).toStrictEqual({ since: 0, dataset: "dataset-a" });
+    expectRows(online.model().replica, n.rows, n.notes);
+    expect(online.model().replica).toMatchObject({ dataset: "dataset-a", revision: 9 });
+    const sent = n.pushes.slice(firstOnlinePush);
+    expect(sent.length).toBeGreaterThan(0);
+    const tapped = new Map(waiting.map((intent) => [intent.id, intent.since]));
+
+    for (const push of sent) {
+      for (const intent of push.commands) {
+        expect(push.since).toBe(tapped.get(intent.id));
+      }
+    }
+
+    const stored = await f.open(currentRow).port.load();
+    expectRows(stored.replica, n.rows, n.notes);
+    expect(stored.replica.revision).toBe(9);
+    expect(stored.commands.map((intent) => [intent.id, intent.since])).toStrictEqual([
+      [1, 5],
+      [2, 7],
+      [3, 6],
+    ]);
+  }
+);
