@@ -139,11 +139,11 @@ export const SCHEMA = {
   indexes: "create index if not exists history_order on history(value, id);",
 };
 
-function readRow(raw: Record<string, SQLOutputValue>): Row {
+export function readRow(raw: Record<string, SQLOutputValue>): Row {
   return row.parse({ ...raw, deleted: raw.deleted === 1 });
 }
 
-class Store extends SyncStore {
+export class Store extends SyncStore {
   constructor(path: string) {
     super(path, { name: "notes", schema: SCHEMA });
   }
