@@ -27,7 +27,10 @@ export type WebConfig = {
         subjectClaim: string;
       }
     | undefined;
-  /** `sub:<subject>`, `email:<address>`, or `service:<client id>` for a proxy's service token. */
+  /**
+   * `sub:<subject>`, `email:<address>`, `service:<client id>` for a proxy's service token, or `key:<name>` for an
+   * agent's key (`slopkit/server/keys`).
+   */
   allow: string[];
 };
 
@@ -178,12 +181,14 @@ export function parseWebConfig(value: unknown, warnings: string[]): WebConfig {
   const allow = Array.isArray(listed)
     ? listed.filter(
         (entry): entry is string =>
-          typeof entry === "string" && /^(sub|email|service):.+$/.test(entry)
+          typeof entry === "string" && /^(sub|email|service|key):.+$/.test(entry)
       )
     : [];
 
   if (!Array.isArray(listed) || allow.length !== listed.length) {
-    throw new Error("web.allow must list sub:<subject>, email:<address> or service:<client id>");
+    throw new Error(
+      "web.allow must list sub:<subject>, email:<address>, service:<client id> or key:<name>"
+    );
   }
 
   if (access === undefined && oidc === undefined) {

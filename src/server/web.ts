@@ -4,8 +4,12 @@
  * (an access proxy's JWT or the server's own OIDC login), the Host must be ours, and every POST and the socket must come
  * from the page's own Origin. Responses carry a strict CSP and no framing.
  *
+ * An agent's key (`Authorization: Bearer`) decides a request alone and needs no Origin: the Origin check guards
+ * credentials a browser sends on its own (cookies), and a bearer isn't one.
+ *
  * Routes are contract endpoints: the request is checked against its schema before the handler runs and the reply
  * after, so neither side can drift from the contract. Failures answer `{ kind, message, path? }` with the kind's status.
+ * Raw routes (`rawRoute`) take and answer bytes behind the same guards, with their own body limit.
  * The socket is a hint channel: the app sends small messages (pokes, pings); nothing correct depends on it.
  * Every API request is logged with an id, status, time and whether a person or a service asked.
  */
@@ -43,11 +47,11 @@ const SECURITY = {
     "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; manifest-src 'self'; worker-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 };
 
-/** Who asked: their identities, whether a person (not a service token), and how they signed in. */
+/** Who asked: their identities, whether a person (not a service token or a key), and how they signed in. */
 export type Caller = {
   identities: string[];
   person: boolean;
-  login: "access" | "oidc";
+  login: "access" | "oidc" | "key";
   request: string;
 };
 
@@ -65,22 +69,35 @@ export class Refusal extends Error {
   }
 }
 
+/** A body limit as given: a positive whole number of bytes. */
+function bodyBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 1) {
+    throw new Error(`a body limit must be a positive integer, got ${bytes}`);
+  }
+
+  return bytes;
+}
+
 /** A route: an endpoint and its handler, typed together and run untyped by the server. */
 export type Route = {
   method: "GET" | "POST";
   path: string;
   person: boolean;
+  /** Its own request body limit; `serveWeb`'s `bodyLimit` when absent. */
+  bodyLimit?: number;
   run: (input: unknown, caller: Caller) => Promise<unknown>;
 };
 
 export function route<Req, Res>(
   endpoint: Endpoint<Req, Res>,
-  handle: (request: Req, caller: Caller) => Res | Promise<Res>
+  handle: (request: Req, caller: Caller) => Res | Promise<Res>,
+  options: { bodyLimit?: number } = {}
 ): Route {
   return {
     method: endpoint.method,
     path: endpoint.path,
     person: endpoint.person,
+    ...(options.bodyLimit === undefined ? {} : { bodyLimit: bodyBytes(options.bodyLimit) }),
     run: async (input, caller) => {
       let request: Req;
 
@@ -99,6 +116,63 @@ export function route<Req, Res>(
     },
   };
 }
+
+/** What a raw route's handler gets: the URL, what a `/*` path matched past its prefix, the bounded body, the headers. */
+export type RawRequest = {
+  url: URL;
+  params: { "*": string };
+  body: Buffer | undefined;
+  headers: IncomingMessage["headers"];
+};
+
+/**
+ * What a raw route answers. `cache`: `immutable` for content named by its hash (kept for a year, by this browser only),
+ * else `no-store`. `sandbox`: the bytes are served in a sandbox (an image or a file someone else made). The security
+ * headers are always the server's: `headers` can add others (`etag`, `content-disposition`), never replace those.
+ */
+export type RawReply = {
+  status: number;
+  type: string;
+  body: Buffer | string;
+  cache?: "immutable" | "no-store";
+  sandbox?: boolean;
+  headers?: Record<string, string>;
+};
+
+/** A route that takes and answers bytes, behind every guard a contract route has. */
+export type RawRoute = {
+  raw: true;
+  method: "GET" | "POST";
+  /** Exact, or a prefix ending in `/*`. */
+  path: string;
+  person: boolean;
+  bodyLimit: number;
+  handle: (request: RawRequest, caller: Caller) => RawReply | Promise<RawReply>;
+};
+
+export function rawRoute(definition: {
+  method: "GET" | "POST";
+  path: string;
+  person?: boolean;
+  bodyLimit?: number;
+  handle: RawRoute["handle"];
+}): RawRoute {
+  if (!/^\/[^*]*(\/\*)?$/.test(definition.path)) {
+    throw new Error(`a raw route's path is exact or ends in /*: ${definition.path}`);
+  }
+
+  return {
+    raw: true,
+    method: definition.method,
+    path: definition.path,
+    person: definition.person ?? false,
+    bodyLimit: bodyBytes(definition.bodyLimit ?? 65_536),
+    handle: definition.handle,
+  };
+}
+
+/** Types already compressed: gzipping them again only costs time. */
+const COMPRESSIBLE = /^(text\/|application\/(json|javascript|xml|manifest\+json)|image\/svg\+xml)/;
 
 export type Socket = {
   path: string;
@@ -130,8 +204,13 @@ function send(
 ): void {
   let bytes = typeof body === "string" ? Buffer.from(body) : body;
   const extra: Record<string, string> = {};
+  const type = headers["content-type"] ?? "text/plain";
 
-  if (bytes.length > 1024 && /\bgzip\b/.test(header(request, "accept-encoding") ?? "")) {
+  if (
+    bytes.length > 1024 &&
+    COMPRESSIBLE.test(type) &&
+    /\bgzip\b/.test(header(request, "accept-encoding") ?? "")
+  ) {
     bytes = gzipSync(bytes, { level: 6 });
     extra["content-encoding"] = "gzip";
     extra.vary = "accept-encoding";
@@ -163,11 +242,14 @@ function failure(
   );
 }
 
-/**
- * The body as JSON: its bytes collected and counted against `limit`, then decoded once, so a character split between
- * chunks arrives whole. Bytes that aren't UTF-8 are refused, never replaced.
- */
-async function readBody(request: IncomingMessage, limit: number): Promise<unknown> {
+/** The body's bytes, counted against `limit` as they arrive: past it, refused before anything reads them. */
+async function readBytes(request: IncomingMessage, limit: number): Promise<Buffer> {
+  const declared = Number(header(request, "content-length"));
+
+  if (Number.isFinite(declared) && declared > limit) {
+    throw new Refusal("invalid", "the request is too large");
+  }
+
   const chunks: Buffer[] = [];
   let size = 0;
 
@@ -182,10 +264,19 @@ async function readBody(request: IncomingMessage, limit: number): Promise<unknow
     chunks.push(bytes);
   }
 
+  return Buffer.concat(chunks);
+}
+
+/**
+ * The body as JSON: its bytes collected and counted against `limit`, then decoded once, so a character split between
+ * chunks arrives whole. Bytes that aren't UTF-8 are refused, never replaced.
+ */
+async function readBody(request: IncomingMessage, limit: number): Promise<unknown> {
+  const bytes = await readBytes(request, limit);
   let text: string;
 
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
     throw new Refusal("invalid", "the request is not UTF-8");
   }
@@ -206,11 +297,15 @@ export type WebOptions = {
   assets: string;
   /** The install manifest. */
   manifest: Record<string, unknown>;
-  routes: Route[];
+  /** Contract routes (`route`) and routes that take and answer bytes (`rawRoute`). */
+  routes: (Route | RawRoute)[];
   socket?: Socket;
   /** The session cookie's name. */
   cookie: string;
-  /** Request bodies past this many bytes are refused; default 64 KiB. Give a push endpoint `PUSH_BYTES` or more. */
+  /**
+   * Request bodies past this many bytes are refused, unless a route sets its own; default 64 KiB. Give a push endpoint
+   * `PUSH_BYTES` or more.
+   */
   bodyLimit?: number;
 };
 
@@ -222,13 +317,62 @@ export async function serveWeb(
   const hosts = new Set<string>();
   const origins = new Set<string>();
   let plainHost: string | undefined;
-  const routes = new Map(options.routes.map((each) => [`${each.method} ${each.path}`, each]));
+  const contract = options.routes.filter((each): each is Route => !("raw" in each));
+  const raws = options.routes.filter((each): each is RawRoute => "raw" in each);
+  const routes = new Map(contract.map((each) => [`${each.method} ${each.path}`, each]));
   const manifest = JSON.stringify(options.manifest);
+
+  // A raw route can't take over the login, the socket or the manifest, or shadow another route.
+  for (const each of raws) {
+    const prefix = each.path.endsWith("/*") ? each.path.slice(0, -1) : undefined;
+
+    const covers = (path: string) =>
+      prefix === undefined ? path === each.path : path.startsWith(prefix);
+
+    if (
+      each.path.startsWith("/auth/") ||
+      covers("/auth/login") ||
+      covers("/manifest.webmanifest") ||
+      (options.socket !== undefined && covers(options.socket.path)) ||
+      contract.some((other) => covers(other.path))
+    ) {
+      throw new Error(`a raw route can't serve ${each.path}`);
+    }
+  }
+
+  if (new Set(raws.map((each) => `${each.method} ${each.path}`)).size !== raws.length) {
+    throw new Error("two raw routes have the same method and path");
+  }
+
+  /** The raw routes for a path, most specific first, with what a `/*` matched. */
+  function rawFor(path: string): { found: RawRoute; params: string }[] {
+    // Matched on the decoded path, so a prefix's remainder is decoded exactly once.
+    return raws
+      .flatMap((each) => {
+        if (each.path === path) {
+          return [{ found: each, params: "", rank: Number.MAX_SAFE_INTEGER }];
+        }
+
+        const prefix = each.path.endsWith("/*") ? each.path.slice(0, -1) : undefined;
+
+        return prefix !== undefined && path.startsWith(prefix) && path.length > prefix.length
+          ? [{ found: each, params: path.slice(prefix.length), rank: prefix.length }]
+          : [];
+      })
+      .toSorted((a, b) => b.rank - a.rank);
+  }
 
   /** The caller, or undefined when not signed in, or false when signed in but not allowed. */
   async function identify(request: IncomingMessage): Promise<Caller | false | undefined> {
+    const authorization = header(request, "authorization");
+
+    // Any Authorization is a bearer's claim: one that isn't a well-formed bearer is refused, never ignored.
+    const bearer =
+      authorization === undefined ? undefined : (/^Bearer (\S+)$/.exec(authorization)?.[1] ?? "");
+
     const jwt = header(request, "cf-access-jwt-assertion");
-    const identities = await auth.identify(jwt, sessionToken(request, cookie));
+
+    const identities = await auth.identify(jwt, sessionToken(request, cookie), bearer);
 
     if (identities === undefined || identities === false) {
       return identities;
@@ -236,10 +380,117 @@ export async function serveWeb(
 
     return {
       identities,
-      person: !identities.some((identity) => identity.startsWith("service:")),
-      login: jwt === undefined ? "oidc" : "access",
+      person: !identities.some(
+        (identity) => identity.startsWith("service:") || identity.startsWith("key:")
+      ),
+      login: bearer === undefined ? (jwt === undefined ? "oidc" : "access") : "key",
       request: randomBytes(6).toString("base64url"),
     };
+  }
+
+  /** Whether a request may act: a key always (it isn't sent on its own); a cookie or proxy only from the page. */
+  const fromPage = (request: IncomingMessage, caller: Caller): boolean =>
+    caller.login === "key" || origins.has(header(request, "origin") ?? "");
+
+  /** Log one request's outcome, as every route does. */
+  function logged(
+    caller: Caller,
+    method: string,
+    path: string,
+    status: number,
+    started: number
+  ): void {
+    log(status < 400 ? "info" : "warn", "request", {
+      request: caller.request,
+      method,
+      path,
+      status,
+      ms: Math.round(performance.now() - started),
+      person: caller.person,
+      ...(caller.login === "key" ? { caller: caller.identities.join(" ") } : {}),
+    });
+  }
+
+  async function raw(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    caller: Caller,
+    candidates: { found: RawRoute; params: string }[]
+  ): Promise<void> {
+    const started = performance.now();
+    const method = request.method === "HEAD" ? "GET" : (request.method ?? "GET");
+    const match = candidates.find((each) => each.found.method === method);
+    let status = 200;
+
+    try {
+      if (match === undefined) {
+        status = 405;
+        send(request, response, 405, "Method not allowed");
+        logged(caller, method, url.pathname, status, started);
+
+        return;
+      }
+
+      const { found, params } = match;
+
+      if (method === "POST" && !fromPage(request, caller)) {
+        throw new Refusal("forbidden", "bad origin");
+      }
+
+      if (found.person && !caller.person) {
+        throw new Refusal("forbidden", "only a person's login can do this");
+      }
+
+      const body = method === "POST" ? await readBytes(request, found.bodyLimit) : undefined;
+
+      const reply = await found.handle(
+        { url, params: { "*": params }, body, headers: request.headers },
+        caller
+      );
+
+      status = reply.status;
+
+      const own = Object.fromEntries(
+        Object.entries(reply.headers ?? {}).filter(
+          ([name]) =>
+            !(name.toLowerCase() in SECURITY) &&
+            !["content-type", "content-encoding", "cache-control", "vary"].includes(
+              name.toLowerCase()
+            )
+        )
+      );
+
+      send(request, response, reply.status, reply.body, {
+        ...own,
+        "content-type": reply.type,
+        "cache-control":
+          reply.cache === "immutable" ? "private, max-age=31536000, immutable" : "no-store",
+        ...(reply.sandbox === true
+          ? { "content-security-policy": `${SECURITY["content-security-policy"]}; sandbox` }
+          : {}),
+      });
+    } catch (error) {
+      const kind = error instanceof Refusal ? error.kind : "unavailable";
+      status = STATUS[kind];
+
+      if (!(error instanceof Refusal)) {
+        log("error", "handler failed", {
+          request: caller.request,
+          path: url.pathname,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+
+      failure(
+        request,
+        response,
+        kind,
+        error instanceof Refusal ? error.message : "the server failed; see its log"
+      );
+    }
+
+    logged(caller, method, url.pathname, status, started);
   }
 
   async function asset(
@@ -317,7 +568,7 @@ export async function serveWeb(
       }
 
       // A page from anywhere else must never act with this browser's credentials.
-      if (method === "POST" && !origins.has(header(request, "origin") ?? "")) {
+      if (method === "POST" && !fromPage(request, caller)) {
         throw new Refusal("forbidden", "bad origin");
       }
 
@@ -328,7 +579,7 @@ export async function serveWeb(
       let input: unknown;
 
       if (method === "POST") {
-        input = await readBody(request, options.bodyLimit ?? 65_536);
+        input = await readBody(request, found.bodyLimit ?? options.bodyLimit ?? 65_536);
       } else {
         const q = url.searchParams.get("q");
 
@@ -363,14 +614,7 @@ export async function serveWeb(
       );
     }
 
-    log(status < 400 ? "info" : "warn", "request", {
-      request: caller.request,
-      method,
-      path: url.pathname,
-      status,
-      ms: Math.round(performance.now() - started),
-      person: caller.person,
-    });
+    logged(caller, method, url.pathname, status, started);
   }
 
   /** The sockets each sign-in session opened, so signing out closes them. */
@@ -461,6 +705,20 @@ export async function serveWeb(
         );
       }
 
+      let decoded: string;
+
+      try {
+        decoded = decodeURIComponent(url.pathname);
+      } catch {
+        return send(request, response, 400, "Bad path");
+      }
+
+      const candidates = rawFor(decoded);
+
+      if (candidates.length > 0) {
+        return await raw(request, response, url, caller, candidates);
+      }
+
       if (url.pathname.startsWith("/api/")) {
         return await api(request, response, url, caller);
       }
@@ -503,14 +761,14 @@ export async function serveWeb(
         return refuse(404);
       }
 
-      if (!origins.has(header(request, "origin") ?? "")) {
-        return refuse(403);
-      }
-
       const caller = await identify(request);
 
       if (caller === undefined || caller === false) {
         return refuse(caller === false ? 403 : 401);
+      }
+
+      if (!fromPage(request, caller)) {
+        return refuse(403);
       }
 
       const open = options.socket.open;

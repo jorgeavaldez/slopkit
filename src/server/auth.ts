@@ -1,7 +1,7 @@
 /**
- * Who a web request is: Cloudflare Access's signed JWT (`Cf-Access-Jwt-Assertion`), or a session from this server's
- * own OpenID Connect login (authorization code with PKCE). The issuer, audience and claims come from `web.json`.
- * Either way the identity must be on `web.allow`.
+ * Who a web request is: an agent's key (`Authorization: Bearer`, see `keys.ts`), Cloudflare Access's signed JWT
+ * (`Cf-Access-Jwt-Assertion`), or a session from this server's own OpenID Connect login (authorization code with
+ * PKCE). The issuer, audience and claims come from `web.json`. Either way the identity must be on `web.allow`.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
@@ -11,6 +11,7 @@ import { createRemoteJWKSet, jwtVerify } from "jose";
 import type { JWTPayload } from "jose";
 
 import type { WebConfig } from "./config.ts";
+import { Keys } from "./keys.ts";
 
 const SESSION_DAYS = 7;
 const PENDING_MS = 10 * 60_000;
@@ -66,6 +67,7 @@ export class WebAuth {
     { verifier: string; nonce: string; redirect: string; expires: number }
   >();
   private readonly env: Readonly<Record<string, string | undefined>>;
+  private readonly keys: Keys;
 
   constructor(config: WebConfig, home: string, env: Readonly<Record<string, string | undefined>>) {
     if (config.access === undefined && config.oidc === undefined) {
@@ -81,6 +83,7 @@ export class WebAuth {
     this.config = config;
     this.env = env;
     this.sessionsPath = join(home, "web-sessions.json");
+    this.keys = new Keys(home);
     this.accessKeys =
       config.access === undefined
         ? undefined
@@ -98,14 +101,22 @@ export class WebAuth {
   }
 
   /**
-   * The allowed identities of a request: from the proxy's JWT when it sends one (a bad one is refused, never ignored),
-   * else from the session token (the session cookie's value). `undefined` means not signed in; `false`, signed in but
+   * The allowed identities of a request: from an agent's bearer key when it sends one, else the proxy's JWT when it
+   * sends one (a bad one of either is refused, never ignored), else from the session token (the session cookie's value). `undefined` means not signed in; `false`, signed in but
    * not allowed.
    */
   async identify(
     proxyJwt: string | undefined,
-    token: string | undefined
+    token: string | undefined,
+    bearer?: string
   ): Promise<Identities | false | undefined> {
+    // A bearer decides alone: one that doesn't verify is refused, never passed over for a cookie or a proxy's header.
+    if (bearer !== undefined) {
+      const name = await this.keys.verify(bearer);
+
+      return name === undefined ? false : (this.allowed([`key:${name}`]) ?? false);
+    }
+
     if (proxyJwt !== undefined) {
       const access = this.config.access;
 

@@ -102,6 +102,10 @@
       "types": "./dist/server/log.d.ts",
       "default": "./dist/server/log.js"
     },
+    "./server/keys": {
+      "types": "./dist/server/keys.d.ts",
+      "default": "./dist/server/keys.js"
+    },
     "./server/secrets": {
       "types": "./dist/server/secrets.d.ts",
       "default": "./dist/server/secrets.js"
