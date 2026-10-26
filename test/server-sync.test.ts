@@ -17,8 +17,12 @@ import { KIT_ANSWERS, pokes, serveSync, syncHandlers, syncRoutes } from "../src/
 import type { Caller } from "../src/server/web.ts";
 import { api, AGENT, CLIENT, fixture, PERSON, row, command, serverSchema } from "./sync-fixture.ts";
 
-const scopeOf = (identities: readonly string[]) =>
-  createHash("sha256").update(identities.toSorted().join("\n")).digest("base64url").slice(0, 22);
+const scopeOf = (identities: readonly string[]) => {
+  const subjects = identities.filter((identity) => identity.startsWith("sub:"));
+  const stable = subjects.length === 0 ? identities : subjects;
+
+  return createHash("sha256").update(stable.toSorted().join("\n")).digest("base64url").slice(0, 22);
+};
 
 function nextMessage(socket: WebSocket) {
   return new Promise<ReturnType<typeof api.socket.message.parse>>((resolve) => {

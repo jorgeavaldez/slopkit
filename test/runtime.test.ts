@@ -10,6 +10,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { string } from "../src/schema.ts";
 import type { Infer } from "../src/schema.ts";
+import * as web from "../src/server/web.ts";
 import type { Model, Pending } from "../src/sync.ts";
 import { indexedReplica } from "../src/web/replica.ts";
 import { createRuntime } from "../src/web/runtime.ts";
@@ -17,8 +18,12 @@ import type { RuntimeEnv } from "../src/web/runtime.ts";
 import { api, empty, engine, fixture, pending, serverSchema, tables } from "./sync-fixture.ts";
 import type { Command, Outcome, Patch, Tables } from "./sync-fixture.ts";
 
-const scopeOf = (identities: readonly string[]) =>
-  createHash("sha256").update(identities.toSorted().join("\n")).digest("base64url").slice(0, 22);
+const scopeOf = (identities: readonly string[]) => {
+  const subjects = identities.filter((identity) => identity.startsWith("sub:"));
+  const stable = subjects.length === 0 ? identities : subjects;
+
+  return createHash("sha256").update(stable.toSorted().join("\n")).digest("base64url").slice(0, 22);
+};
 
 type RuntimeModel = Model<Tables, Infer<typeof serverSchema>, Command, Outcome>;
 
@@ -1324,7 +1329,7 @@ test("nobody keeps no rows or final commands, acts on nothing, and reloads once 
   }
 });
 
-test("a cookie change before a push sends nothing and never marks the durable intent sending", async () => {
+test("a tap after the cookie changes is not kept for either person and reloads once", async () => {
   const h = await harness();
 
   try {
@@ -1339,8 +1344,12 @@ test("a cookie change before a push sends nothing and never marks the durable in
     ).toStrictEqual([]);
     expect(h.actions).toStrictEqual([]);
     const kept = (await copyOnDisk(h.factory, h.name).load()).commands;
-    expect(kept).toHaveLength(1);
-    expect(kept[0]?.state).toStrictEqual({ kind: "queued" });
+    expect(kept).toStrictEqual([]);
+    expect(h.runtime.model().commands).toStrictEqual([]);
+    expect((await copyOnDisk(h.factory, `${h.name}~${otherWho}`).load()).commands).toStrictEqual(
+      []
+    );
+    expect((await copyOnDisk(h.factory, `${h.name}~`).load()).commands).toStrictEqual([]);
     expect(h.reloads()).toBe(1);
     h.scheduler.advance(5000);
     await h.runtime.settle();
@@ -1439,6 +1448,167 @@ test("every pull and push carries the copy's person, including later commands", 
     expect(pushes[0]?.as).toBe(firstWho);
     expect(h.actions).toStrictEqual(["scoped"]);
   } finally {
+    await h.close();
+  }
+});
+
+test("added, removed, and changed email identities keep the person's copy and queued intent", async () => {
+  const identities = ["sub:someone", "email:first@example.test"];
+  const h = await harness({
+    name: "notes",
+    person: true,
+    cookie: `notes_who=${web.whoOf(identities)}`,
+  });
+  const opened: ReturnType<typeof reopen>[] = [];
+  let current = h.runtime;
+
+  try {
+    h.store.put("kept-row", 5);
+    current.start();
+    await current.settle();
+    await h.readySocket();
+    expect(current.who).toBe(otherWho);
+    h.setOffline(true);
+    current.command({ name: "put", id: "email-intent", value: 7 });
+    await current.settle();
+    const original = (await copyOnDisk(h.factory, h.name).load()).commands[0];
+
+    expect(original).toMatchObject({
+      client: current.client,
+      id: 1,
+      command: { name: "put", id: "email-intent", value: 7 },
+    });
+    expect(original?.state.kind).not.toBe("done");
+
+    for (const nextIdentities of [
+      ["sub:someone"],
+      ["email:first@example.test", "sub:someone"],
+      ["sub:someone", "email:changed@example.test"],
+      ["email:changed@example.test", "sub:someone", "email:extra@example.test"],
+    ]) {
+      h.document.cookie = `${h.name}_who=${web.whoOf(nextIdentities)}`;
+      h.scheduler.advance(1000);
+      await current.settle();
+      expect(h.reloads()).toBe(0);
+      current.stop();
+      current = reopen(h);
+      opened.push(current);
+      current.start();
+      await current.settle();
+      expect(current.who).toBe(otherWho);
+      expect(
+        [...current.model().replica.tables.history.values()].map((row) => [row.id, row.value])
+      ).toStrictEqual([["kept-row", 5]]);
+      expect(current.model().commands).toHaveLength(1);
+      expect(current.model().commands[0]).toMatchObject({
+        client: original?.client,
+        id: original?.id,
+        command: original?.command,
+      });
+      expect(current.model().commands[0]?.state.kind).not.toBe("done");
+    }
+
+    current.stop();
+    h.setOffline(false);
+    current = reopen(h);
+    opened.push(current);
+    current.start();
+    await current.settle();
+    expect(h.reloads()).toBe(0);
+    expect(h.actions).toStrictEqual(["email-intent"]);
+    expect(current.model().commands[0]).toMatchObject({
+      client: original?.client,
+      id: original?.id,
+      state: { kind: "done", outcome: { kind: "ok", resource: "email-intent" } },
+    });
+    expect(current.model().replica.tables.history.get("kept-row")?.value).toBe(5);
+    expect(current.model().replica.tables.history.get("email-intent")?.value).toBe(7);
+  } finally {
+    for (const runtime of opened) {
+      runtime.stop();
+    }
+
+    await h.close();
+  }
+});
+
+test("becoming visible checks a changed person immediately, without waiting for a tick", async () => {
+  const h = await harness();
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    await h.readySocket();
+    h.document.visible("hidden");
+    await h.runtime.settle();
+    const before = h.captures.filter((c) => c.path === "/api/pull" || c.path === "/api/push");
+
+    h.document.cookie = `${h.name}_who=${otherWho}`;
+    expect(h.reloads()).toBe(0);
+    h.document.visible("visible");
+    expect(h.reloads()).toBe(1);
+    await h.runtime.settle();
+    h.document.visible("hidden");
+    h.document.visible("visible");
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(1);
+    expect(
+      h.captures.filter((c) => c.path === "/api/pull" || c.path === "/api/push")
+    ).toStrictEqual(before);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a person change between keeping an intent and its push mark replaces storage, never reports a failed disk", async () => {
+  const h = await harness();
+  let changed = false;
+  const states: string[] = [];
+
+  const unsubscribe = h.runtime.subscribe((model) => {
+    if (
+      model.commands.some(
+        (intent) => intent.command.id === "kept-before-change" && intent.state.kind === "sending"
+      )
+    ) {
+      // Another tab's sign-in can land after this tap was kept, before the push's durable mark.
+      changed = true;
+      h.document.cookie = `${h.name}_who=${otherWho}`;
+    }
+
+    states.push(model.storage.kind);
+  });
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    await h.readySocket();
+    h.captures.splice(0);
+    h.runtime.command({ name: "put", id: "kept-before-change", value: 8 });
+    await h.runtime.settle();
+    expect(changed).toBe(true);
+    expect(h.runtime.model().storage).toStrictEqual({ kind: "replaced" });
+    expect(states).toContain("replaced");
+    expect(states).not.toContain("failed");
+    expect(
+      h.captures.filter((c) => c.path === "/api/push" || c.path === "/api/pull")
+    ).toStrictEqual([]);
+    expect(h.actions).toStrictEqual([]);
+    const kept = (await copyOnDisk(h.factory, h.name).load()).commands;
+
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({
+      command: { id: "kept-before-change" },
+      state: { kind: "queued" },
+    });
+    expect(h.reloads()).toBe(1);
+    h.scheduler.advance(1000);
+    await h.runtime.settle();
+    expect(h.runtime.model().storage).toStrictEqual({ kind: "replaced" });
+    expect((await copyOnDisk(h.factory, h.name).load()).commands).toStrictEqual(kept);
+    expect(h.reloads()).toBe(1);
+  } finally {
+    unsubscribe();
     await h.close();
   }
 });

@@ -192,17 +192,38 @@ test("a file's brotli copy goes only to a client that takes brotli", async () =>
   }
 });
 
-const personKey = (identities: readonly string[]) =>
-  createHash("sha256").update(identities.toSorted().join("\n")).digest("base64url").slice(0, 22);
+const personKey = (identities: readonly string[]) => {
+  const subjects = identities.filter((identity) => identity.startsWith("sub:"));
+  const stable = subjects.length === 0 ? identities : subjects;
+
+  return createHash("sha256").update(stable.toSorted().join("\n")).digest("base64url").slice(0, 22);
+};
 
 const whoCookies = (response: Response) =>
   response.headers.getSetCookie().filter((cookie) => cookie.startsWith("hello_who="));
 
-test("whoOf names the sorted whole identity set with a 22-character base64url SHA256", () => {
+test("whoOf hashes sorted subjects only, falling back to every identity when there is no subject", () => {
   const identities = ["sub:z", "email:a@example.test", "sub:a"];
   const before = [...identities];
-  expect(web.whoOf(identities)).toBe(personKey(identities));
-  expect(web.whoOf(identities.toReversed())).toBe(personKey(identities));
+  const expected = personKey(["sub:a", "sub:z"]);
+
+  expect(web.whoOf(identities)).toBe(expected);
+  expect(web.whoOf(identities.toReversed())).toBe(expected);
+
+  for (const emails of [
+    [],
+    ["email:old@example.test"],
+    ["email:new@example.test"],
+    ["email:one@example.test", "email:two@example.test"],
+  ]) {
+    expect(web.whoOf(["sub:z", ...emails, "sub:a"])).toBe(expected);
+  }
+
+  const withoutSubject = ["key:fixture", "email:a@example.test"];
+
+  expect(web.whoOf(withoutSubject)).toBe(personKey(withoutSubject));
+  expect(web.whoOf(withoutSubject.toReversed())).toBe(personKey(withoutSubject));
+  expect(web.whoOf(["email:a@example.test"])).not.toBe(web.whoOf(["email:b@example.test"]));
   expect(web.whoOf([])).toBe("47DEQpj8HBSa-_TImW-5JC");
   expect(web.whoOf(["sub:a"])).not.toBe(web.whoOf(["sub:z"]));
   expect(identities).toStrictEqual(before);
