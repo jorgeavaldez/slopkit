@@ -6,6 +6,8 @@
  * - both a Map's keys and values count as reached view data (view-problems.test.ts).
  * Error assertions only pin the spec's words, not a driver's incidental diagnostics.
  */
+import { createHash } from "node:crypto";
+
 import { afterEach, expect, test } from "vitest";
 
 import { MEANINGS } from "../src/states.ts";
@@ -217,7 +219,7 @@ test("the stand-in logs in as owner, signOut yields 401, and signIn restores the
   const p = await open();
   expect(server.web.bind).toBe("127.0.0.1");
   expect(server.web.port).toBe(0);
-  expect(server.web.allow).toStrictEqual(["sub:owner"]);
+  expect(server.web.allow.toSorted()).toStrictEqual(["sub:other", "sub:owner"]);
   expect(new URL(server.web.oidc?.issuer ?? "").hostname).toBe("127.0.0.1");
   await p.press("send x");
   expect(server.received[0]).toMatchObject({ identities: ["sub:owner"], person: true });
@@ -468,4 +470,93 @@ test("reload hides the old page and fires pagehide before keeping its last draft
   await p.reload();
   expect(p.text("saved exit draft")).toBe("saved while leaving");
   expect(p.text("saved exit events")).toBe("visibility:hidden pagehide");
+});
+
+const personScope = (subject: "owner" | "other") =>
+  createHash("sha256").update(`sub:${subject}`).digest("base64url").slice(0, 22);
+
+test("two people on one device keep their own copy and unresolved commands, and only the owner sends the old intent", async () => {
+  const p = await open();
+  const device = p.device();
+  expect(p.text("copy person")).toBe(personScope("owner"));
+  expect(p.text("private rows")).toBe("owner-private:11");
+  expect(p.text("page cookies")).toContain(`page-fixture_who=${personScope("owner")}`);
+  expect(p.text("page cookies")).not.toContain("page-fixture_session=");
+  await p.signOut();
+  await p.press("send x");
+  expect(server.received).toStrictEqual([]);
+  expect(p.text("pending commands")).toContain("x:");
+  expect(p.text("private rows")).toBe("owner-private:11");
+  expect(p.text("transactions")).toContain("seed:42");
+  await p.signIn({ as: "other" });
+  // signIn updates the cookie; the running page itself notices and reloads, on the same device.
+  await p.advance(1000);
+  expect(p.device()).toBe(device);
+  expect(p.text("copy person")).toBe(personScope("other"));
+  expect(p.text("private rows")).toBe("other-private:22");
+  expect(p.text("pending commands")).not.toContain("x:");
+  expect(p.text("transactions")).not.toContain("x:9");
+  expect(server.received).toStrictEqual([]);
+  expect(structuredClone(server.store.db.prepare("select * from commands").all())).toStrictEqual(
+    []
+  );
+  expect(
+    server.replies
+      .filter((reply) => reply.identities.includes("sub:other"))
+      .flatMap((reply) => reply.commands)
+  ).toStrictEqual([]);
+  await p.press("probe identity");
+  expect(p.text("identity")).toContain('"sub:other"');
+  await p.signOut();
+  await p.reload();
+  expect(p.text("private rows")).toBe("other-private:22");
+  expect(p.text("pending commands")).not.toContain("x:");
+  const pullsBefore = server.pulls.length;
+  await p.signIn();
+  await p.advance(1000);
+  expect(p.device()).toBe(device);
+  expect(p.text("copy person")).toBe(personScope("owner"));
+  expect(p.text("private rows")).toBe("owner-private:11");
+  expect(p.text("transactions")).toContain("x:9");
+  expect(p.text("pending commands")).toContain("x:done");
+  expect(
+    server.received.map((each) => ({ command: each.command, identities: each.identities }))
+  ).toStrictEqual([{ command: { name: "put", id: "x", value: 9 }, identities: ["sub:owner"] }]);
+  expect(
+    server.pulls.slice(pullsBefore).every((pull) => pull.dataset !== null && pull.since > 0)
+  ).toBe(true);
+});
+
+test("the page's own reload finishes before the press returns and retains the same device", async () => {
+  const p = await open();
+  const device = p.device();
+  await p.type("local draft", "kept on this device");
+  await p.press("start interval");
+  await p.advance(100);
+  expect(p.text("ticks")).toBe("1");
+  await p.press("page reload");
+  expect(p.device()).toBe(device);
+  expect(p.text("ticks")).toBe("0");
+  expect(p.text("saved local draft")).toBe("kept on this device");
+  expect(p.text("private rows")).toBe("owner-private:11");
+});
+
+test("the driver keeps every response cookie, hides HttpOnly, sends both, and removes Max-Age=0", async () => {
+  const p = await open();
+  await p.press("readable cookie");
+  expect(p.text("page cookies")).toContain("fixture_readable=yes");
+  await p.press("hidden cookie");
+  expect(p.text("page cookies")).not.toContain("fixture_hidden=");
+  await p.press("probe identity");
+  expect(p.text("identity")).toContain('"readableCookie":true');
+  expect(p.text("identity")).toContain('"hiddenCookie":true');
+  expect(p.text("identity")).toContain('"sessionCookie":true');
+  await p.press("clear cookie");
+  expect(p.text("page cookies")).not.toContain("fixture_readable=");
+  await p.signOut();
+  await p.signIn();
+  await p.press("probe identity");
+  expect(p.text("identity")).toContain('"readableCookie":false');
+  expect(p.text("identity")).toContain('"hiddenCookie":true');
+  expect(p.text("identity")).toContain('"sessionCookie":true');
 });

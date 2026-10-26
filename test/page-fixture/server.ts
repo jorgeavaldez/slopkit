@@ -16,6 +16,8 @@ export type ServerInput = { home: string; web: WebConfig; now: () => number; log
 export async function startServer({ home, web, now, log }: ServerInput) {
   const store = new Store(join(home, "page.sqlite"));
   store.put("seed", 42);
+  store.put("owner-private", 11, "settings");
+  store.put("other-private", 22, "settings");
 
   const jobs = store.createJobs<string>({
     encode: JSON.stringify,
@@ -32,6 +34,12 @@ export async function startServer({ home, web, now, log }: ServerInput) {
 
   const pulls: { dataset: string | null; since: number }[] = [];
   const serverTimers: string[] = [];
+  const replies: { identities: string[]; commands: { client?: string; id: number }[] }[] = [];
+
+  const privateRows = (since: number, caller: Caller) =>
+    store
+      .rows("settings", since)
+      .filter((row) => caller.identities.includes(`sub:${row.id.split("-")[0]}`));
 
   const ledger = store.createLedger<Outcome>({
     encode: JSON.stringify,
@@ -53,8 +61,11 @@ export async function startServer({ home, web, now, log }: ServerInput) {
       read: readRow,
       through: (values: readonly SQLOutputValue[]) => String(values[0]),
     },
-    unpaged: (since: number) => ({ settings: store.rows("settings", since) }),
-    everything: () => ({ history: store.rows("history"), settings: store.rows("settings") }),
+    unpaged: (since: number, caller: Caller) => ({ settings: privateRows(since, caller) }),
+    everything: (caller: Caller) => ({
+      history: store.rows("history"),
+      settings: privateRows(0, caller),
+    }),
     outcome: (kept: Outcome) => kept,
     names: (kept: Outcome) => (kept.kind === "ok" ? [kept.resource] : []),
     limits: { firstRows: 2, pageRows: 2, maxRows: 6, maxBytes: 16_000 },
@@ -86,7 +97,11 @@ export async function startServer({ home, web, now, log }: ServerInput) {
     pull: (request: Parameters<typeof sync.pull>[0], caller: Caller) => {
       pulls.push({ dataset: request.dataset, since: request.since });
 
-      return sync.pull(request, caller);
+      return sync.pull(request, caller).then((reply) => {
+        replies.push({ identities: caller.identities, commands: reply.commands });
+
+        return reply;
+      });
     },
   };
 
@@ -104,13 +119,31 @@ export async function startServer({ home, web, now, log }: ServerInput) {
     sync: observed,
     routes: [
       rawRoute({
+        path: "/driver-cookie",
+        method: "GET",
+        handle: (request) => ({
+          status: 200,
+          type: "text/plain",
+          body: "ok",
+          headers: {
+            "set-cookie":
+              request.url.searchParams.get("kind") === "hidden"
+                ? "fixture_hidden=yes; Path=/; HttpOnly; SameSite=Lax"
+                : `fixture_readable=${request.url.searchParams.get("kind") === "clear" ? "" : "yes"}; Path=/; SameSite=Lax; Max-Age=${request.url.searchParams.get("kind") === "clear" ? 0 : 60}`,
+          },
+        }),
+      }),
+      rawRoute({
         path: "/identity",
         method: "GET",
-        handle: (_request, caller) => ({
+        handle: (request, caller) => ({
           status: 200,
           type: "application/json",
           body: JSON.stringify({
             identities: caller.identities,
+            sessionCookie: (request.headers.cookie ?? "").includes("page-fixture_session="),
+            readableCookie: (request.headers.cookie ?? "").includes("fixture_readable=yes"),
+            hiddenCookie: (request.headers.cookie ?? "").includes("fixture_hidden=yes"),
             person: caller.person,
             now: now(),
             date: Date.now(),
@@ -139,6 +172,7 @@ export async function startServer({ home, web, now, log }: ServerInput) {
     store,
     received,
     pulls,
+    replies,
     serverTimers,
     web,
     now,

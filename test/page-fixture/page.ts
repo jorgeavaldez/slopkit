@@ -340,6 +340,35 @@ function paint() {
       h("output", { "aria-label": "identity" }, probe),
       h("output", { "aria-label": "page clock" }, `${Date.now()}:${new Date().toISOString()}`),
       h("output", { "aria-label": "connection" }, runtime.model().connection.kind),
+      h("output", { "aria-label": "copy person" }, runtime.who),
+      h("output", { "aria-label": "page cookies" }, document.cookie),
+      h(
+        "output",
+        { "aria-label": "pending commands" },
+        runtime
+          .model()
+          .commands.map((p) => `${p.command.id}:${p.state.kind}`)
+          .join(" ")
+      ),
+      h(
+        "section",
+        { "aria-label": "private rows" },
+        [...runtime.model().replica.tables.settings.values()].map((row) =>
+          h("p", { key: row.id }, `${row.id}:${row.value}`)
+        )
+      ),
+      ...["readable", "hidden", "clear"].map((kind) =>
+        h(
+          "button",
+          {
+            onClick: () => {
+              void fetch(`/driver-cookie?kind=${kind}`).then(() => paint());
+            },
+          },
+          `${kind} cookie`
+        )
+      ),
+      h("button", { onClick: () => window.location.reload() }, "page reload"),
       h("output", { "aria-label": "viewport" }, `${window.innerWidth}x${window.innerHeight}`),
       h(
         "output",

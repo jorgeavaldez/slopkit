@@ -17,6 +17,9 @@ import type { RuntimeEnv } from "../src/web/runtime.ts";
 import { api, empty, engine, fixture, pending, serverSchema, tables } from "./sync-fixture.ts";
 import type { Command, Outcome, Patch, Tables } from "./sync-fixture.ts";
 
+const scopeOf = (identities: readonly string[]) =>
+  createHash("sha256").update(identities.toSorted().join("\n")).digest("base64url").slice(0, 22);
+
 type RuntimeModel = Model<Tables, Infer<typeof serverSchema>, Command, Outcome>;
 
 function socketText(data: RawData): string {
@@ -71,6 +74,7 @@ class Scheduler {
 }
 
 class DocumentPort {
+  cookie = "";
   visibilityState: DocumentVisibilityState = "visible";
   readonly listeners = new Set<() => void>();
   addEventListener(_type: string, listener: () => void) {
@@ -105,6 +109,9 @@ type Captured = { path: string; body: unknown; url: string };
 async function harness(
   options: {
     persist?: () => Promise<boolean>;
+    cookie?: string;
+    offline?: boolean;
+    person?: boolean;
     factory?: IDBFactory;
     name?: string;
     painted?: (model: RuntimeModel) => Record<string, string | number | boolean | null> | undefined;
@@ -114,7 +121,12 @@ async function harness(
 ) {
   const f = await fixture();
   const scheduler = new Scheduler();
-  const document = new DocumentPort();
+  const pageDocument = new DocumentPort();
+  let offline = options.offline ?? false;
+
+  const identityHeaders: Record<string, string> =
+    options.person === true ? { cookie: await f.login(), origin: f.server.url } : f.headers;
+
   const captures: Captured[] = [];
   let telemetryStatus = 200;
   let telemetryGate: ReturnType<typeof deferred<void>> | undefined;
@@ -193,12 +205,13 @@ async function harness(
 
     const upstream = await fetch(`${f.server.url}${request.url}`, {
       method: request.method ?? "GET",
-      headers: { ...f.headers, "content-type": "application/json" },
+      headers: { ...identityHeaders, "content-type": "application/json" },
       ...(text ? { body: text } : {}),
     });
 
     response.writeHead(upstream.status, {
       "content-type": upstream.headers.get("content-type") ?? "application/json",
+      "set-cookie": upstream.headers.getSetCookie(),
     });
     response.end(Buffer.from(await upstream.arrayBuffer()));
 
@@ -250,6 +263,9 @@ async function harness(
   const host = `127.0.0.1:${address.port}`;
   const factory = options.factory ?? new IDBFactory();
   const name = options.name ?? "runtime-fixture";
+  pageDocument.cookie =
+    options.cookie ??
+    `${name}_who=${scopeOf([options.person === true ? "sub:someone" : "key:fixture"])}`;
   const received = new WeakSet<WebSocket>();
   const sockets: WebSocket[] = [];
   const socketUrls: string[] = [];
@@ -260,13 +276,25 @@ async function harness(
 
   const env: RuntimeEnv = {
     indexedDB: factory,
-    fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+    fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
       fetches.push({
         url: input instanceof Request ? input.url : input instanceof URL ? input.href : input,
         signal: init?.signal,
       });
 
-      return fetch(input, init);
+      if (offline) {
+        throw new TypeError("the device is offline");
+      }
+
+      const response = await fetch(input, init);
+
+      for (const cookie of response.headers.getSetCookie()) {
+        if (cookie.startsWith(`${name}_who=`)) {
+          pageDocument.cookie = cookie.split(";")[0] ?? "";
+        }
+      }
+
+      return response;
     },
     socket: (url: string) => {
       socketUrls.push(url);
@@ -303,7 +331,7 @@ async function harness(
         reloads++;
       },
     },
-    document,
+    document: pageDocument,
     persist: () => {
       persistCalls++;
 
@@ -335,7 +363,7 @@ async function harness(
     ...f,
     runtime,
     scheduler,
-    document,
+    document: pageDocument,
     factory,
     name,
     captures,
@@ -344,6 +372,9 @@ async function harness(
     fetches,
     host,
     env,
+    setOffline: (value: boolean) => {
+      offline = value;
+    },
     rejectSockets: (refuse: boolean) => {
       refuseSocket = refuse;
     },
@@ -703,6 +734,7 @@ test("pulls omit false verify, but keep the engine's paging cursor and awaited c
       .map((c) => api.pull.request.parse(c.body));
 
     expect(pulls[0]).toStrictEqual({
+      as: scopeOf(["key:fixture"]),
       client: h.runtime.client,
       dataset: null,
       since: 0,
@@ -1081,6 +1113,331 @@ test("a failed telemetry batch and concurrently recorded events still fit the ne
     expect(events(h.telemetry().slice(1)).map((event) => event.attributes?.i)).toStrictEqual(
       Array.from({ length: 100 }, (_, i) => i + 50)
     );
+  } finally {
+    await h.close();
+  }
+});
+
+const firstWho = scopeOf(["key:fixture"]);
+const otherWho = scopeOf(["sub:someone"]);
+
+function copyOnDisk(factory: IDBFactory, name: string) {
+  return indexedReplica<Tables, Patch, Infer<typeof serverSchema>, Command, Outcome>({
+    factory,
+    name,
+    version: 1,
+    tables,
+    empty,
+    pending,
+    server: serverSchema,
+  });
+}
+
+async function legacyCopy(factory: IDBFactory, name: string) {
+  const port = copyOnDisk(factory, name);
+  await port.load();
+  await port.commit({
+    replica: {
+      dataset: "legacy-data",
+      revision: 7,
+      server: { version: "v1" },
+      tables: {
+        history: new Map([
+          [
+            "first-person-only",
+            { id: "first-person-only", value: 41, deleted: false, revision: 7 },
+          ],
+        ]),
+        settings: new Map(),
+      },
+    },
+    reset: true,
+    base: 0,
+    replaces: null,
+    ops: [],
+  });
+  await port.keep({
+    client: "legacy_page",
+    id: 1,
+    dataset: "legacy-data",
+    since: 7,
+    command: { name: "put", id: "legacy-intent", value: 4 },
+    at: 1000,
+    state: { kind: "queued" },
+  });
+}
+
+function reopen(h: Awaited<ReturnType<typeof harness>>, pageDocument = h.document) {
+  return createRuntime({
+    name: h.name,
+    api,
+    sync: engine,
+    replica: { version: 1, tables, empty },
+    env: { ...h.env, document: pageDocument },
+  });
+}
+
+test("the first person keeps the earlier release's copy and outbox; another sees neither, and forget is personal", async () => {
+  const factory = new IDBFactory();
+  await legacyCopy(factory, "legacy-phone");
+  const h = await harness({ factory, name: "legacy-phone", offline: true });
+  const others: ReturnType<typeof reopen>[] = [];
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    expect(h.runtime.who).toBe(firstWho);
+    expect([...h.runtime.model().replica.tables.history.keys()]).toStrictEqual([
+      "first-person-only",
+    ]);
+    expect(h.runtime.model().commands.map((p) => p.command.id)).toStrictEqual(["legacy-intent"]);
+    h.runtime.stop();
+    h.document.cookie = `unrelated=x; ${h.name}_who=${otherWho}; tail=y`;
+    const other = reopen(h);
+    others.push(other);
+    other.start();
+    await other.settle();
+    expect(other.who).toBe(otherWho);
+    expect([...other.model().replica.tables.history.keys()]).toStrictEqual([]);
+    expect(other.model().commands).toStrictEqual([]);
+    other.command({ name: "put", id: "other-intent", value: 2 });
+    await other.settle();
+    expect(
+      (await copyOnDisk(factory, `${h.name}~${otherWho}`).load()).commands.map((p) => p.command.id)
+    ).toStrictEqual(["other-intent"]);
+    await other.forget();
+    other.stop();
+    expect((await copyOnDisk(factory, `${h.name}~${otherWho}`).load()).commands).toStrictEqual([]);
+    h.document.cookie = `${h.name}_who=${firstWho}`;
+    const first = reopen(h);
+    others.push(first);
+    first.start();
+    await first.settle();
+    expect([...first.model().replica.tables.history.keys()]).toStrictEqual(["first-person-only"]);
+    expect(first.model().commands.map((p) => p.command.id)).toStrictEqual(["legacy-intent"]);
+    expect(
+      (await copyOnDisk(factory, h.name).load()).commands.map((p) => p.command.id)
+    ).toStrictEqual(["legacy-intent"]);
+  } finally {
+    for (const runtime of others) {
+      runtime.stop();
+    }
+
+    await h.close();
+  }
+});
+
+test("two people opening together cannot both claim the earlier release's database", async () => {
+  const factory = new IDBFactory();
+  await legacyCopy(factory, "claim-race");
+  const h = await harness({ factory, name: "claim-race", offline: true });
+  const pageDocument = new DocumentPort();
+  pageDocument.cookie = `${h.name}_who=${otherWho}`;
+  const other = reopen(h, pageDocument);
+
+  try {
+    h.runtime.start();
+    other.start();
+    await Promise.all([h.runtime.settle(), other.settle()]);
+
+    const copies = [h.runtime, other].map((runtime) => [
+      ...runtime.model().replica.tables.history.keys(),
+    ]);
+
+    expect(copies.filter((rows) => rows.includes("first-person-only"))).toHaveLength(1);
+    expect(copies.filter((rows) => rows.length === 0)).toHaveLength(1);
+    expect(
+      [h.runtime, other].flatMap((runtime) => runtime.model().commands).map((p) => p.command.id)
+    ).toStrictEqual(["legacy-intent"]);
+  } finally {
+    other.stop();
+    await h.close();
+  }
+});
+
+test("nobody keeps no rows or final commands, acts on nothing, and reloads once when the cookie names someone", async () => {
+  const factory = new IDBFactory();
+  await legacyCopy(factory, "nobody-phone");
+
+  const h = await harness({
+    factory,
+    name: "nobody-phone",
+    person: true,
+    cookie: "nobody-phone_who_else=decoy",
+    offline: true,
+  });
+
+  let first: ReturnType<typeof reopen> | undefined;
+
+  try {
+    h.store.put("server-only", 9);
+    h.runtime.start();
+    await h.runtime.settle();
+    expect(h.runtime.who).toBe("");
+    expect([...h.runtime.model().replica.tables.history.keys()]).toStrictEqual([]);
+    expect(h.runtime.model().commands).toStrictEqual([]);
+    h.runtime.command({ name: "put", id: "nobody-command", value: 2 });
+    await h.runtime.settle();
+    h.setOffline(false);
+    h.scheduler.advance(120_000);
+    await h.runtime.settle();
+    expect(h.actions).toStrictEqual([]);
+    expect(structuredClone(h.store.db.prepare("select * from commands").all())).toStrictEqual([]);
+    expect(
+      h.captures
+        .filter((c) => c.path === "/api/push")
+        .every((c) => api.push.request.parse(c.body).as === "")
+    ).toBe(true);
+    expect([...h.runtime.model().replica.tables.history.keys()]).toStrictEqual([]);
+    const nobodyCopy = await copyOnDisk(factory, `${h.name}~`).load();
+
+    expect([...nobodyCopy.replica.tables.history.keys()]).toStrictEqual([]);
+    expect(nobodyCopy.commands.map((p) => p.command.id)).toStrictEqual(["nobody-command"]);
+    expect(nobodyCopy.commands.every((p) => p.state.kind !== "done")).toBe(true);
+    expect(
+      h.captures.filter((c) => c.path === "/api/pull").map((c) => api.pull.request.parse(c.body).as)
+    ).toStrictEqual([""]);
+    expect(h.document.cookie).toBe(`${h.name}_who=${otherWho}`);
+    expect(h.reloads()).toBe(1);
+    h.scheduler.advance(3000);
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(1);
+    h.runtime.stop();
+    // Nobody must not have claimed <name>; the first named person still gets the old copy, offline.
+    h.setOffline(true);
+    first = reopen(h);
+    first.start();
+    await first.settle();
+    expect(first.who).toBe(otherWho);
+    expect([...first.model().replica.tables.history.keys()]).toStrictEqual(["first-person-only"]);
+    expect(
+      (await copyOnDisk(factory, h.name).load()).commands.some(
+        (p) => p.command.id === "legacy-intent"
+      )
+    ).toBe(true);
+    expect(
+      (await copyOnDisk(factory, `${h.name}~`).load()).commands.map((p) => p.command.id)
+    ).toStrictEqual(["nobody-command"]);
+  } finally {
+    first?.stop();
+    await h.close();
+  }
+});
+
+test("a cookie change before a push sends nothing and never marks the durable intent sending", async () => {
+  const h = await harness();
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    h.captures.splice(0);
+    h.document.cookie = `${h.name}_who=${otherWho}`;
+    h.runtime.command({ name: "put", id: "belongs-to-first", value: 8 });
+    await h.runtime.settle();
+    expect(
+      h.captures.filter((c) => c.path === "/api/push" || c.path === "/api/pull")
+    ).toStrictEqual([]);
+    expect(h.actions).toStrictEqual([]);
+    const kept = (await copyOnDisk(h.factory, h.name).load()).commands;
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.state).toStrictEqual({ kind: "queued" });
+    expect(h.reloads()).toBe(1);
+    h.scheduler.advance(5000);
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(1);
+    expect((await copyOnDisk(h.factory, h.name).load()).commands).toStrictEqual(kept);
+  } finally {
+    await h.close();
+  }
+});
+
+test("an idle tick notices another person's cookie and reloads once without another sync call", async () => {
+  const h = await harness();
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    await h.readySocket();
+    const count = h.captures.length;
+    h.document.cookie = `${h.name}_who=${otherWho}`;
+    h.scheduler.advance(999);
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(0);
+    h.scheduler.advance(1);
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(1);
+    h.scheduler.advance(2000);
+    await h.runtime.settle();
+    expect(h.reloads()).toBe(1);
+    expect(h.captures).toHaveLength(count);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a cookie change before a pull blocks it, even when a socket owes newer rows", async () => {
+  const h = await harness();
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    await h.readySocket();
+    const before = h.captures.filter((c) => c.path === "/api/pull").length;
+    h.document.cookie = `${h.name}_who=${otherWho}`;
+    const delivered = once(h.lastSocket(), "message");
+    h.store.put("must-not-pull", 2);
+    h.serverSocket().send(JSON.stringify({ type: "poke", revision: h.store.revision() }));
+    await delivered;
+    await h.runtime.settle();
+    expect(h.captures.filter((c) => c.path === "/api/pull")).toHaveLength(before);
+    expect(h.runtime.model().replica.tables.history.has("must-not-pull")).toBe(false);
+    expect(h.reloads()).toBe(1);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a refused call that corrects the cookie reloads instead of showing the other caller's rows", async () => {
+  const h = await harness({ person: true, cookie: `runtime-fixture_who=${firstWho}` });
+
+  try {
+    h.store.put("other-person-row", 7);
+    h.runtime.start();
+    await h.runtime.settle();
+    expect(h.runtime.who).toBe(firstWho);
+    expect(h.document.cookie).toBe(`${h.name}_who=${otherWho}`);
+    expect(h.reloads()).toBe(1);
+    expect([...h.runtime.model().replica.tables.history.keys()]).toStrictEqual([]);
+    expect(
+      h.captures.filter((c) => c.path === "/api/pull").map((c) => api.pull.request.parse(c.body).as)
+    ).toStrictEqual([firstWho]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("every pull and push carries the copy's person, including later commands", async () => {
+  const h = await harness();
+
+  try {
+    h.runtime.start();
+    await h.runtime.settle();
+    h.runtime.command({ name: "put", id: "scoped", value: 3 });
+    await h.runtime.settle();
+
+    const pulls = h.captures
+      .filter((c) => c.path === "/api/pull")
+      .map((c) => api.pull.request.parse(c.body));
+
+    const pushes = h.captures
+      .filter((c) => c.path === "/api/push")
+      .map((c) => api.push.request.parse(c.body));
+
+    expect(pulls.length).toBeGreaterThan(0);
+    expect(pushes).toHaveLength(1);
+    expect(pulls.every((request) => request.as === firstWho)).toBe(true);
+    expect(pushes[0]?.as).toBe(firstWho);
+    expect(h.actions).toStrictEqual(["scoped"]);
   } finally {
     await h.close();
   }

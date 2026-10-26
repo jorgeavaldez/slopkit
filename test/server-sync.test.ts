@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import type { SQLOutputValue } from "node:sqlite";
@@ -15,6 +16,9 @@ import type { KitOutcome as ServerKitOutcome } from "../src/server/sync.ts";
 import { KIT_ANSWERS, pokes, serveSync, syncHandlers, syncRoutes } from "../src/server/sync.ts";
 import type { Caller } from "../src/server/web.ts";
 import { api, AGENT, CLIENT, fixture, PERSON, row, command, serverSchema } from "./sync-fixture.ts";
+
+const scopeOf = (identities: readonly string[]) =>
+  createHash("sha256").update(identities.toSorted().join("\n")).digest("base64url").slice(0, 22);
 
 function nextMessage(socket: WebSocket) {
   return new Promise<ReturnType<typeof api.socket.message.parse>>((resolve) => {
@@ -1019,3 +1023,116 @@ test("rows only a person may read stay out of a service's pull, deltas and check
     await f.close();
   }
 });
+
+test.each(["pull", "push"] as const)(
+  "%s checks as before its handler and leaves effects, claims, and rows untouched",
+  async (kind) => {
+    const f = await fixture();
+    let handled = 0;
+
+    const server = await serveSync({
+      name: "notes",
+      api,
+      home: f.home,
+      config: f.config,
+      env: {},
+      log: () => {},
+      page: () => {},
+      assets: f.home,
+      sync: {
+        ...f.sync,
+        pull: (request, caller) => {
+          handled++;
+
+          return f.sync.pull(request, caller);
+        },
+        push: (request, caller) => {
+          handled++;
+
+          return f.sync.push(request, caller);
+        },
+      },
+    });
+
+    const base = new URL(server.url).origin;
+
+    try {
+      f.store.put("private", 42);
+      const cookie = await f.login();
+      const input = kind === "pull" ? pull(null) : ask(f.store.dataset());
+
+      // A forgotten marker (nobody) is not an absent marker (an older release).
+      for (const as of ["", "another-person"]) {
+        const response = await fetch(
+          new URL(kind === "pull" ? encodeUrl(api.pull, { ...input, as }) : api.push.path, base),
+          {
+            ...(kind === "push" ? { method: "POST", body: JSON.stringify({ ...input, as }) } : {}),
+            headers: { cookie, origin: base, "content-type": "application/json" },
+          }
+        );
+
+        expect(response.status).toBe(401);
+        expect(await response.json()).toMatchObject({ kind: "signed-out" });
+        expect(
+          response.headers
+            .getSetCookie()
+            .some((entry) => entry.startsWith(`notes_who=${scopeOf(["sub:someone"])}`))
+        ).toBe(true);
+      }
+
+      expect(handled).toBe(0);
+      expect(f.actions).toStrictEqual([]);
+      expect(structuredClone(f.store.db.prepare("select * from commands").all())).toStrictEqual([]);
+      expect(f.store.rows("history").map((item) => [item.id, item.value])).toStrictEqual([
+        ["private", 42],
+      ]);
+
+      for (const as of [undefined, scopeOf(["sub:someone"])]) {
+        const request = { ...input, ...(as === undefined ? {} : { as }) };
+
+        const response = await fetch(
+          new URL(kind === "pull" ? encodeUrl(api.pull, request) : api.push.path, base),
+          {
+            ...(kind === "push" ? { method: "POST", body: JSON.stringify(request) } : {}),
+            headers: { cookie, origin: base, "content-type": "application/json" },
+          }
+        );
+
+        expect(response.status).toBe(200);
+      }
+
+      expect(handled).toBe(2);
+      expect(f.actions).toStrictEqual(kind === "push" ? ["a"] : []);
+
+      // Keys opt out only by omitting as, never by forging it.
+      const wrongKey = await fetch(
+        new URL(encodeUrl(api.pull, { ...pull(null), as: "wrong" }), base),
+        { headers: f.headers }
+      );
+
+      expect(wrongKey.status).toBe(401);
+      expect(wrongKey.headers.getSetCookie()).toStrictEqual([]);
+      const key = await call(api.pull, pull(null), { base, headers: f.headers });
+      expect(key.ok).toBe(true);
+    } finally {
+      await server.close();
+      await f.close();
+    }
+  }
+);
+
+test.each(["pull", "push"] as const)(
+  "%s's optional as is a string of at most 64 characters",
+  (kind) => {
+    const input = kind === "pull" ? pull(null) : ask(null);
+    const schema = kind === "pull" ? api.pull.request : api.push.request;
+
+    for (const as of ["", "a".repeat(64)]) {
+      expect(schema.parse({ ...input, as })).toMatchObject({ as });
+    }
+
+    expect(() => schema.parse({ ...input, as: "a".repeat(65) })).toThrow(Error);
+    expect(() => schema.parse({ ...input, as: 12 })).toThrow(Error);
+    expect(schema.parse(input)).not.toHaveProperty("as");
+  }
+);
