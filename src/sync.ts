@@ -13,7 +13,8 @@
  *   the server's row at its revision, and a partial copy holds every row at or above its cursor, so every row at or
  *   above `through`. The first reply draws the newest rows at once; the cursor moves only when a reply answers the
  *   copy's own `next`, a reply without a page never changes it, and a row merged below `through` never deepens it.
- *   The disk takes a page's history only from the cursor it moved from, in the transaction that writes its rows.
+ *   The disk takes a page's history only from the cursor it moved from, in the transaction that writes its rows, or
+ *   the whole copy once the page's is complete.
  * - **A partial copy owes its next page**, back to back, until it is complete; a reply that doesn't move it on counts
  *   as a failed pull, for backoff. An old server's reply to a partial copy asks for its whole copy instead.
  * - **Only a complete copy is checked.** No fingerprint is asked for or compared while the copy is partial.
@@ -807,7 +808,9 @@ export function saved<T, S, C, O>(model: Model<T, S, C, O>): boolean {
  * already has this or newer (another tab got there; a complete copy at the same revision is newer than any page), the
  * patch alone when the disk is at least at its base, else the whole replica, so a skipped or failed patch is never
  * covered by a later checkpoint. A delta keeps the disk's own history, and takes the patch's only when the disk is at
- * the cursor the patch moved from (`adopt`): coverage never lands without its rows. A page may replace the disk's
+ * the cursor the patch moved from (`adopt`): coverage never lands without its rows. A complete copy at or past a
+ * partial disk's revision is written whole, so a tab that paged from other cursors than the disk's (another tab moved
+ * it) never leaves it partial under a copy that isn't. A page may replace the disk's
  * dataset only with one it moved to from that very dataset (`replaces`): a tab still on a dataset the server has since
  * replaced is `stale` and never writes it back.
  */
@@ -820,6 +823,8 @@ export function commitPlan(
     base: number;
     replaces: string | null;
     from?: string | null;
+    /** How much history the committing copy holds (unknown: never written whole for it). */
+    history?: History;
   }
 ): "skip" | "delta" | "adopt" | "whole" | "stale" {
   const same = stored.dataset === commit.dataset;
@@ -838,7 +843,11 @@ export function commitPlan(
   }
 
   if (!commit.reset && same && stored.revision >= commit.base) {
-    return disk.kind === "partial" && disk.next === commit.from ? "adopt" : "delta";
+    if (disk.kind === "partial" && disk.next === commit.from) {
+      return "adopt";
+    }
+
+    return disk.kind === "partial" && commit.history?.kind === "complete" ? "whole" : "delta";
   }
 
   return "whole";

@@ -20,10 +20,82 @@ import { deriveDurabilityState, saved } from "../src/sync.ts";
 
 const offline = { ok: false, failure: { kind: "offline", message: "paused" } } as const;
 
+/** A page between the second and the last, for a copy still partial after it. */
+const olderPage = { from: "older:c:30", next: "older:b:20", through: "20", held: 5, total: 6 };
+
 // A page whose write failed, then the next page landing at the same revision: the disk took that page as a delta from
 // a cursor it doesn't hold, so it still lacks the failed page's rows. The page doesn't call that kept: it owes a whole
 // write, says the copy isn't kept, and writes it.
 test("a later page never cancels a failed page's repair", async () => {
+  let abort = false;
+
+  const stored = database({
+    interfere: (what, transaction) => {
+      if (what === "commit" && abort) {
+        abort = false;
+        transaction.abort();
+      }
+    },
+  });
+
+  await stored.port.load();
+  let model = loaded(partialCopy());
+  await stored.port.commit({
+    replica: model.replica,
+    reset: true,
+    base: 0,
+    replaces: null,
+    from: null,
+    ops: [],
+  });
+
+  let effects;
+  [model, effects] = deliver(model, paged(10, middle, secondPage));
+  const failing = effects.find((effect) => effect.kind === "commit");
+
+  if (failing === undefined) {
+    throw new Error("no commit");
+  }
+
+  abort = true;
+  await expect(stored.port.commit(failing)).rejects.toThrow("IndexedDB transaction failed");
+  [model] = sync.update(model, {
+    type: "commitFailed",
+    reason: "aborted",
+    replaced: false,
+    now: 2,
+  });
+  [model, effects] = deliver(model, paged(10, oldest.slice(0, 1), olderPage));
+  const later = effects.find((effect) => effect.kind === "commit");
+
+  if (later === undefined) {
+    throw new Error("no commit");
+  }
+
+  const ack = await stored.port.commit(later);
+  [model, effects] = sync.update(model, { type: "committed", ...ack, now: 4 });
+  expect(saved(model)).toBe(false);
+  expect(deriveDurabilityState(model).kind).not.toBe("ok");
+  const repair = effects.find((effect) => effect.kind === "commit");
+  expect(repair).toMatchObject({ reset: true });
+
+  if (repair === undefined) {
+    throw new Error("no repair");
+  }
+
+  const repaired = await stored.port.commit(repair);
+  [model] = sync.update(model, { type: "committed", ...repaired, now: 5 });
+  expect(saved(model)).toBe(true);
+  expect(deriveDurabilityState(model)).toStrictEqual({ kind: "ok" });
+  const disk = (await database({ factory: stored.factory, name: stored.name }).port.load()).replica;
+  expect(values(disk)).toStrictEqual(values(copy(10, all.slice(0, 5))));
+  expect(history(disk)).toStrictEqual(partialCopy(10, [], olderPage).history);
+});
+
+// A page whose write failed, then the last page landing at the same revision: the disk can't take it as a delta from a
+// cursor it doesn't hold (it would still lack the failed page's rows). The page's copy is complete, so it lands whole,
+// and only then is it kept.
+test("a failed page's repair lands whole with the last page", async () => {
   let abort = false;
 
   const stored = database({
@@ -70,18 +142,7 @@ test("a later page never cancels a failed page's repair", async () => {
   }
 
   const ack = await stored.port.commit(later);
-  [model, effects] = sync.update(model, { type: "committed", ...ack, now: 4 });
-  expect(saved(model)).toBe(false);
-  expect(deriveDurabilityState(model).kind).not.toBe("ok");
-  const repair = effects.find((effect) => effect.kind === "commit");
-  expect(repair).toMatchObject({ reset: true });
-
-  if (repair === undefined) {
-    throw new Error("no repair");
-  }
-
-  const repaired = await stored.port.commit(repair);
-  [model] = sync.update(model, { type: "committed", ...repaired, now: 5 });
+  [model] = sync.update(model, { type: "committed", ...ack, now: 4 });
   expect(saved(model)).toBe(true);
   expect(deriveDurabilityState(model)).toStrictEqual({ kind: "ok" });
   const disk = (await database({ factory: stored.factory, name: stored.name }).port.load()).replica;

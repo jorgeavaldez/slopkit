@@ -24,7 +24,8 @@ or the kit's own tests in `test/`.
   through their lift, new ones empty, rewritten whole and claiming no history (revision 0) until a reset replaces it;
   a copy with a table this release doesn't have, or any other shapes without `lifts`, starts over.
   A partial copy's history is kept with its rows, under row shapes marked partial so a release from before paging
-  never reads it; a delta takes a page's history only at the cursor that page moved from.
+  never reads it; a delta takes a page's history only at the cursor that page moved from, and a complete copy over a
+  partial disk is written whole (two tabs page from different cursors).
 - Nothing is sent before it is kept, and no push before it is kept as in flight; observed and saved revisions are
   separate; a pull is owed while the server is ahead, whatever the socket says; the push channel only pokes (`sync`).
   A push carries the revision each command was tapped against, so a server can refuse intents made on a history it no

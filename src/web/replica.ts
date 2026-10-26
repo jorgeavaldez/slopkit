@@ -17,7 +17,8 @@
  * - A partial copy (a first copy still paging in) keeps its history in the checkpoint, written in the same transaction
  *   as its rows, and marks its row shapes as partial: a release from before paging reads it as another release's copy,
  *   so it never takes part of a history for all of it. A delta takes the patch's history only when the disk is at the
- *   cursor the patch moved from, and a complete copy at a revision is never narrowed to a partial one. The server's facts are not rows: facts an older page kept that no longer fit load as null and
+ *   cursor the patch moved from, and a complete copy at a revision is never narrowed to a partial one; a tab whose copy
+ *   is complete writes it whole over a partial disk (its cursors and the disk's may differ when two tabs page). The server's facts are not rows: facts an older page kept that no longer fit load as null and
  *   never cost the copy; facts that change at the same revision are written too.
  * - An upgrade keeps the outbox and the generation (an intent on disk is never erased; one this version can't read
  *   stays on disk and is counted). With the app's `lifts` (`slopkit/web/lift`) it keeps the copy where it can,
@@ -527,6 +528,7 @@ export function indexedReplica<T, P, S, C, O>(options: {
                 base: commit.base,
                 replaces: commit.replaces,
                 ...(commit.from === undefined ? {} : { from: commit.from }),
+                history: commit.replica.history ?? COMPLETE,
               });
 
         // The disk holds a dataset this page never saw: the server replaced the one this page is on.
