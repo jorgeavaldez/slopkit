@@ -1454,11 +1454,13 @@ test("every pull and push carries the copy's person, including later commands", 
 
 test("added, removed, and changed email identities keep the person's copy and queued intent", async () => {
   const identities = ["sub:someone", "email:first@example.test"];
+
   const h = await harness({
     name: "notes",
     person: true,
     cookie: `notes_who=${web.whoOf(identities)}`,
   });
+
   const opened: ReturnType<typeof reopen>[] = [];
   let current = h.runtime;
 

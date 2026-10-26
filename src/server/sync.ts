@@ -28,7 +28,7 @@ import type { Attributes, Logger } from "./log.ts";
 import { createPull } from "./pull.ts";
 import type { PullLimits, PullOptions } from "./pull.ts";
 import type { SyncStore } from "./store.ts";
-import { route, serveWeb } from "./web.ts";
+import { Refusal, route, serveWeb, whoOf } from "./web.ts";
 import type { Caller, RawRoute, Route, Socket, WebOptions } from "./web.ts";
 
 export type { KitOutcome } from "../api.ts";
@@ -371,6 +371,13 @@ export function syncHandlers<
  * The sync contract's routes: pull, push and telemetry. Each telemetry event is one `page` log line at `info`, its
  * attributes the event's own with the kit's (`client`, `at`, `person`) set last, so a page can't claim another sender.
  */
+/** A copy is only ever synced under its own person's login: another's is refused before anything acts. */
+function theirs(request: { as?: string }, caller: Caller): void {
+  if (request.as !== undefined && request.as !== whoOf(caller.identities)) {
+    throw new Refusal("signed-out", "this page's copy is another person's; sign in as them");
+  }
+}
+
 export function syncRoutes<R, S, C, O>(
   api: SyncApi<R, S, C, O>,
   handlers: Pick<Sync<R, S, C, NoInfer<O> | KitOutcome>, "pull" | "push"> & {
@@ -380,12 +387,16 @@ export function syncRoutes<R, S, C, O>(
   admitted(api);
 
   return [
-    route<PullRequest, PullReply<R, S, O | KitOutcome>>(api.pull, (request, caller) =>
-      handlers.pull(request, caller)
-    ),
-    route<PushRequest<C>, PushReply<O | KitOutcome>>(api.push, (request, caller) =>
-      handlers.push(request, caller)
-    ),
+    route<PullRequest, PullReply<R, S, O | KitOutcome>>(api.pull, (request, caller) => {
+      theirs(request, caller);
+
+      return handlers.pull(request, caller);
+    }),
+    route<PushRequest<C>, PushReply<O | KitOutcome>>(api.push, (request, caller) => {
+      theirs(request, caller);
+
+      return handlers.push(request, caller);
+    }),
     route(api.telemetry, (request, caller) => {
       for (const event of request.events) {
         handlers.page("info", event.name, {
@@ -459,13 +470,14 @@ export type Manifest = {
 };
 
 /**
- * An app's web server: `serveWeb` with the sync routes, the poke socket, the session cookie `<name>_session` and the
- * install manifest made from the name (black, `/icon.svg`), each field overridable. Extra routes are served beside them.
+ * An app's web server: `serveWeb` with the sync routes, the poke socket, the session cookie `<name>_session`, the
+ * page's who cookie `<name>_who` and the install manifest made from the name (black, `/icon.svg`), each field
+ * overridable. Extra routes are served beside them.
  */
 /** What `serveSync` takes: `serveWeb`'s options, less what it makes from these. */
 export type SyncServerOptions<R, S, C, O> = Omit<
   WebOptions,
-  "routes" | "socket" | "cookie" | "manifest"
+  "routes" | "socket" | "cookie" | "who" | "manifest"
 > & {
   name: string;
   api: SyncApi<R, S, C, O>;
@@ -491,6 +503,7 @@ export async function serveSync<R, S, C, O>(
   return await serveWeb({
     ...web,
     cookie: `${name}_session`,
+    who: `${name}_who`,
     manifest: {
       id: "/",
       name,

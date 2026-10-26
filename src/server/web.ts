@@ -13,7 +13,7 @@
  * The socket is a hint channel: the app sends small messages (pokes, pings); nothing correct depends on it.
  * Every API request is logged with an id, status, time and whether a person or a service asked.
  */
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -243,6 +243,25 @@ function sessionToken(request: IncomingMessage, cookie: string): string | undefi
 /** How long a sign-in keeps the page it interrupted. */
 const BACK_SECONDS = 600;
 
+/** How long a page remembers who the device's last person was: a browser's longest cookie. */
+const WHO_SECONDS = 400 * 86_400;
+
+/**
+ * Whose a page's copy is: an opaque key of a caller's subject (the base64url of the SHA-256 of its `sub:` identities,
+ * sorted and joined by newlines, or of all its identities when it has none; 22 characters). Only the subject: an email
+ * can change at the provider, and a person must keep their copy when it does. The server names it to the page in the
+ * `who` cookie; the page keeps each person's copy and outbox under it and sends it with every pull and push (`as`),
+ * refused when it isn't the caller's.
+ */
+export function whoOf(identities: readonly string[]): string {
+  const subjects = identities.filter((identity) => identity.startsWith("sub:"));
+
+  return createHash("sha256")
+    .update((subjects.length > 0 ? subjects : identities).toSorted().join("\n"))
+    .digest("base64url")
+    .slice(0, 22);
+}
+
 function decodeCookie(value: string | undefined): string | undefined {
   try {
     return value === undefined ? undefined : decodeURIComponent(value);
@@ -373,6 +392,12 @@ export type WebOptions = {
   /** The session cookie's name. */
   cookie: string;
   /**
+   * The cookie naming who the page is for (`whoOf`), readable by the page: set at sign-in and on any answer to a
+   * login whose cookie doesn't name it yet, never to a key; sign-out leaves it (the device's last person). None when
+   * absent; a page on `slopkit/web/runtime` needs it, named `<name>_who` (`serveSync` sets it).
+   */
+  who?: string;
+  /**
    * Request bodies past this many bytes are refused, unless a route sets its own; default 64 KiB. Give a push endpoint
    * `PUSH_BYTES` or more.
    */
@@ -383,6 +408,10 @@ export async function serveWeb(
   options: WebOptions
 ): Promise<{ url: string; port: number; close: () => Promise<void> }> {
   const { config, log, cookie } = options;
+
+  const whoCookie = (who: string, secure: string) =>
+    `${options.who ?? ""}=${who}; Path=/;${secure} SameSite=Lax; Max-Age=${WHO_SECONDS}`;
+
   const auth = new WebAuth(config, options.home, options.env);
   const hosts = new Set<string>();
   const origins = new Set<string>();
@@ -735,10 +764,18 @@ export async function serveWeb(
           // Every sign-in starts at /auth/login, which sets or clears this, so it is never an older one's.
           const back = onThisServer(decodeCookie(sessionToken(request, `${cookie}_back`)));
 
-          return send(request, response, 302, "", {
-            location: back ?? "/",
-            "set-cookie": `${cookie}=${token}; Path=/; HttpOnly;${secure} SameSite=Lax; Max-Age=${7 * 86_400}`,
-          });
+          // Who the page it returns to is for, named before that page loads, as its requests will be identified.
+          const identities =
+            options.who === undefined
+              ? undefined
+              : await auth.identify(header(request, "cf-access-jwt-assertion"), token);
+
+          response.setHeader("set-cookie", [
+            `${cookie}=${token}; Path=/; HttpOnly;${secure} SameSite=Lax; Max-Age=${7 * 86_400}`,
+            ...(Array.isArray(identities) ? [whoCookie(whoOf(identities), secure)] : []),
+          ]);
+
+          return send(request, response, 302, "", { location: back ?? "/" });
         } catch (error) {
           log("warn", "sign-in failed", { reason: error instanceof Error ? error.message : "" });
 
@@ -792,6 +829,15 @@ export async function serveWeb(
           caller === false ? "forbidden" : "signed-out",
           caller === false ? "not allowed" : "sign in first"
         );
+      }
+
+      // The page learns who it is for from any answer to a person, before its own code runs when that's the shell.
+      if (options.who !== undefined && caller.login !== "key") {
+        const who = whoOf(caller.identities);
+
+        if (sessionToken(request, options.who) !== who) {
+          response.setHeader("set-cookie", whoCookie(who, secure));
+        }
       }
 
       let decoded: string;

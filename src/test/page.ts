@@ -113,10 +113,13 @@ export type Page = {
   location: () => string;
   /** History back within the page (an entry it pushed): the address moves and the page hears popstate; then settles. */
   back: () => Promise<void>;
-  /** Drops the session: the server then answers this page as no one. */
+  /**
+   * The session lapses: the server then answers this page as no one. The device's other cookies stay, as a browser
+   * keeps them.
+   */
   signOut: () => Promise<void>;
-  /** Signs in again through the stand-in. */
-  signIn: () => Promise<void>;
+  /** Signs in again through the stand-in, as its owner or as another person on the same device. */
+  signIn: (options?: { as?: "owner" | "other" }) => Promise<void>;
   readonly now: number;
   close: () => Promise<void>;
 };
@@ -145,6 +148,9 @@ const QUIET_LIMIT_MS = 10_000;
 const FIRES = 200;
 
 const ROUNDS = 200;
+
+/** The most times a page reloads itself within one settle. */
+const RELOADS = 5;
 const QUIET_CHECKS = 3;
 const QUIET_MS = 2;
 const realSetTimeout = globalThis.setTimeout;
@@ -412,7 +418,7 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         port: 0,
         bind: "127.0.0.1",
         oidc: { issuer: provider.issuer, clientId: "page" },
-        allow: ["sub:owner"],
+        allow: ["sub:owner", "sub:other"],
       },
       []
     );
@@ -462,25 +468,57 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
 
     const base = new URL(server.url);
     const origin = base.origin;
-    let cookie = "";
+    /** The server's cookies, as the browser keeps them (across loads and devices); `http`: hidden from the page. */
+    const jar = new Map<string, { value: string; http: boolean }>();
+    /** The session cookie's name: the first the sign-in's callback set. */
+    let session: string | undefined;
 
-    // The server's own login, through the stand-in: its redirects followed by hand, the last session cookie kept.
-    const signIn = async () => {
+    /** Keeps what a `Set-Cookie` says: a value, or gone at `Max-Age=0`. */
+    const keep = (line: string, http = /;\s*httponly/i.test(line)) => {
+      const [pair = ""] = line.split(";");
+      const equals = pair.indexOf("=");
+
+      if (equals < 1) {
+        return;
+      }
+
+      const name = pair.slice(0, equals).trim();
+
+      if (/;\s*max-age=0\b/i.test(line)) {
+        jar.delete(name);
+      } else {
+        jar.set(name, { value: pair.slice(equals + 1).trim(), http });
+      }
+    };
+
+    const remember = (response: Response, url: URL) => {
+      if (url.origin === origin) {
+        for (const line of response.headers.getSetCookie()) {
+          keep(line);
+        }
+      }
+    };
+
+    const cookies = () => [...jar].map(([name, { value }]) => `${name}=${value}`).join("; ");
+
+    // The server's own login, through the stand-in: its redirects followed by hand, its cookies kept.
+    const signIn = async (as: "owner" | "other" = "owner") => {
+      provider.as(as);
       let at = new URL("/auth/login", base);
-      let found = "";
 
       for (let hop = 0; hop < 5; hop++) {
         // oxlint-disable-next-line no-await-in-loop -- each redirect follows the one before
         const response = await fetch(at, {
           redirect: "manual",
-          headers: found === "" ? {} : { cookie: found },
+          headers: at.origin === origin && jar.size > 0 ? { cookie: cookies() } : {},
         });
 
-        const pair = (response.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
-
-        if (/^[^=]+=[^=]/.test(pair)) {
-          found = pair;
+        if (at.origin === origin && at.pathname === "/auth/callback") {
+          const [line = ""] = response.headers.getSetCookie();
+          session = line.slice(0, Math.max(0, line.indexOf("=")));
         }
+
+        remember(response, at);
 
         const location = response.headers.get("location");
 
@@ -491,11 +529,9 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         at = new URL(location, at);
       }
 
-      if (found === "") {
+      if (session === undefined || !jar.has(session)) {
         throw new Error("openPage: the stand-in sign-in gave no session");
       }
-
-      cookie = found;
     };
 
     await signIn();
@@ -515,6 +551,8 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
     let trail: { url: string; state: unknown }[] = [];
     let at = 0;
     let window: Window | undefined;
+    /** The page asked to reload itself (`location.reload()`). */
+    let reloadAsked = false;
 
     let entry: E | undefined;
     let pageGlobals: (() => void)[] = [];
@@ -528,8 +566,8 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
       }
 
       if (url.origin === origin) {
-        if (cookie !== "") {
-          headers.set("cookie", cookie);
+        if (jar.size > 0) {
+          headers.set("cookie", cookies());
         }
 
         headers.set("origin", origin);
@@ -542,6 +580,7 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         const method = init.method ?? (input instanceof Request ? input.method : "GET");
 
         const response = await nodeFetch(url, { ...init, method, headers });
+        remember(response, url);
         // The body is read here, so the request counts as in flight until it has all arrived.
 
         const body =
@@ -566,7 +605,9 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
 
     class PageSocket extends NodeSocket {
       constructor(url: string | URL) {
-        super(String(url), { headers: cookie === "" ? { origin } : { cookie, origin } });
+        super(String(url), {
+          headers: jar.size === 0 ? { origin } : { cookie: cookies(), origin },
+        });
         sockets.add(this);
         this.once("close", () => {
           sockets.delete(this);
@@ -659,6 +700,26 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         url: trail[0]?.url ?? address,
         width: options.viewport?.width ?? 412,
         height: options.viewport?.height ?? 915,
+      });
+
+      // The page sees the cookies a browser shows it: the server's, less the HttpOnly ones; what it sets is kept.
+      Object.defineProperty(window.document, "cookie", {
+        configurable: true,
+        get: () =>
+          [...jar]
+            .flatMap(([name, each]) => (each.http ? [] : [`${name}=${each.value}`]))
+            .join("; "),
+        set: (line: string) => {
+          keep(line, false);
+        },
+      });
+
+      // The page reloading itself is a reload on this device, as a browser's; it runs once what asked for it settles.
+      Object.defineProperty(window.location, "reload", {
+        configurable: true,
+        value: () => {
+          reloadAsked = true;
+        },
       });
 
       // The entries a reload keeps, back to the one the tab is on: same document, so going back fires popstate.
@@ -916,6 +977,7 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
     ): Promise<{ lines: ReadLine[]; problems: string[] }> => {
       const horizon = clock.now + within;
       let rounds = 0;
+      let reloads = 0;
 
       for (;;) {
         if (++rounds > ROUNDS) {
@@ -934,6 +996,20 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         // Each round waits for the last one's work: real I/O, then the jobs it made due, then their I/O.
         // oxlint-disable-next-line no-await-in-loop -- in order, by design
         await step();
+
+        if (reloadAsked) {
+          reloadAsked = false;
+
+          if (++reloads > RELOADS) {
+            throw new Error(`the page never settles: it reloaded itself ${RELOADS} times`);
+          }
+
+          // oxlint-disable-next-line no-await-in-loop -- the page goes before the next one loads
+          await unload();
+          // oxlint-disable-next-line no-await-in-loop -- as above
+          await load();
+          continue;
+        }
 
         const next = first(horizon);
 
@@ -1087,14 +1163,17 @@ export async function openPage<E>(options: PageOptions<E>): Promise<Page> {
         await settle();
       },
       async signOut() {
-        cookie = "";
+        if (session !== undefined) {
+          jar.delete(session);
+        }
+
         const { problems } = await settle({ lenient: true });
 
         // Page errors in signing out fail the next settle; its view is checked again there.
         errors.push(...problems.filter((each) => !each.includes(" (working) but owes ")));
       },
-      async signIn() {
-        await signIn();
+      async signIn(signing = {}) {
+        await signIn(signing.as);
         await settle();
       },
       get now() {

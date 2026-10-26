@@ -87,6 +87,7 @@ await page.press(/save/); // by accessible name; settles, then checks the view
 await page.reload(); // same device: IndexedDB, localStorage, sessionStorage and the address kept
 const laptop = page.device();
 await page.reload({ device: "new" }); // another device, its storage empty; `reload({ device: laptop })` goes back
+await page.signIn({ as: "other" }); // another person on the same device: they never see the owner's copy
 
 // the page calls it, and the server answers after checking the login, the request and the reply
 const sent = await call(save, { text: "hi" }); // { ok: true, value: { id } } or a typed failure
@@ -229,6 +230,14 @@ const runtime = createRuntime({ name: "notes", sync, api, replica: { version: 1,
 runtime.subscribe((model) => draw(model));
 runtime.start();
 ```
+
+the copy and the outbox are the signed-in person's: `serveSync` names them to the page in the `notes_who` cookie, the
+runtime opens their own copy before it paints (the device's first person keeps `notes`, anyone else `notes~<who>`),
+and every pull and push says whose copy it is, refused under anyone else's login. so another person signing in on the
+same phone never sees the copy, and nothing queued in it is sent as them; it waits for its own person. the person is
+their login's subject (`sub:`), so an email change keeps their copy; moving between Access and the app's own login
+starts a new one. `createRuntime`'s `name` must be `serveSync`'s, or the page never finds its cookie and stays signed
+out. keep the page's own storage (drafts, settings) under `runtime.who` too.
 
 a release that changes or adds tables starts the device's copy over unless the replica has `lifts`, which keeps
 unchanged tables, lifts changed ones and opens new ones empty (the lift code ships only to apps that pass it):

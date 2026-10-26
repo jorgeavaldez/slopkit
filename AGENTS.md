@@ -51,6 +51,10 @@ or the kit's own tests in `test/`.
   compile where they meet the api.
 - The page's runtime decides nothing (`web/runtime`): the socket only pokes and reconnects with capped backoff;
   telemetry is bounded and never trusted for who sent it (`server/sync` sets the sender).
+- A device's copy and outbox are one person's (`web/runtime`, `server/web`, `server/sync`): the server names the
+  person in the page's who cookie (`whoOf`, set at sign-in and on any answer to a login), the page opens that person's
+  own copy before it paints, and checks the cookie before every pull and push and on every tick; every pull and push
+  carries `as`, and `syncRoutes` refuses one for another person's copy before anything acts.
 - Nothing replaces a release that hasn't started on the home's data (`server/cli`): an update installs aside and boots
   on copies of the store and settings first; each install keeps the one it replaced; a rollback never crosses a
   migration without the store copy from before it; an automatic rollback only undoes an update that never proved

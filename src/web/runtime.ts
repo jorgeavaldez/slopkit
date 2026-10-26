@@ -9,14 +9,19 @@
  * - **Telemetry is bounded:** the newest 100 events wait for a flush (every 30 s and when the page hides); a flush the
  *   network lost puts back the newest 50.
  * - **Updated under the page:** a reconciled pull from another server version reloads the page, once.
+ * - **Each person's own copy:** the copy and the outbox are the person the server's `<name>_who` cookie names (none:
+ *   nobody's, empty). The device's first person keeps `<name>` (so an earlier release's copy stays theirs), anyone
+ *   else gets `<name>~<who>`. Every pull and push says whose copy it is (`as`, refused by the server for anyone else);
+ *   before each, and every tick, a cookie that names someone else sends nothing and reloads into their copy.
  */
 import type { PullReply, SyncApi } from "../api.ts";
-import { createClient } from "../client.ts";
+import { createClient, Replaced } from "../client.ts";
 import { call } from "../contract.ts";
 import { digest } from "../digest.ts";
 import { check } from "../schema.ts";
 import type { Schema } from "../schema.ts";
 import type { createSync, Lens, Model, Pending } from "../sync.ts";
+import { committed, openDatabase, request as answer } from "./idb.ts";
 import type { Lifting } from "./lift.ts";
 import { indexedReplica } from "./replica.ts";
 
@@ -56,6 +61,8 @@ export type RuntimeEnv = {
   location: { protocol: string; host: string; reload: () => void };
   document: {
     readonly visibilityState: string;
+    /** The page's cookies, as `document.cookie` reads them: `<name>_who` names whose copy this is. */
+    readonly cookie: string;
     addEventListener: (type: "visibilitychange", listener: () => void) => void;
     removeEventListener: (type: "visibilitychange", listener: () => void) => void;
   };
@@ -116,7 +123,7 @@ export function createRuntime<
   C,
   O,
 >(options: {
-  /** The IndexedDB database's name. */
+  /** The app's name: its IndexedDB databases are named from it, and its who cookie is `<name>_who`. */
   name: string;
   sync: ReturnType<typeof createSync<T, PullReply<R, S, O>, S, C, O>>;
   api: SyncApi<R, S, C, O>;
@@ -154,17 +161,66 @@ export function createRuntime<
     return lens;
   });
 
-  const storage = indexedReplica({
-    factory: env.indexedDB,
-    name: options.name,
-    version: options.replica.version,
-    tables: options.replica.tables,
-    empty: options.replica.empty,
-    server: api.server,
-    pending: options.replica.pending ?? api.pending,
-    ...(options.replica.legacy === undefined ? {} : { legacy: options.replica.legacy }),
-    ...(options.replica.lifts === undefined ? {} : { lifts: options.replica.lifts }),
-  });
+  /** Who the server last said this page is for: the who cookie, or nobody (""). */
+  const current = (): string => {
+    const key = `${options.name}_who=`;
+
+    for (const part of env.document.cookie.split(";")) {
+      if (part.trim().startsWith(key)) {
+        return part.trim().slice(key.length);
+      }
+    }
+
+    return "";
+  };
+
+  const who = current();
+
+  /** The database of this person's copy: `name` if they are the device's first person (they claimed it), else their own. */
+  const copy = async (): Promise<string> => {
+    if (who === "") {
+      return `${options.name}~`;
+    }
+
+    const directory = await openDatabase(env.indexedDB, `${options.name}~owner`, 1, (database) => {
+      database.createObjectStore("owner");
+    });
+
+    try {
+      const transaction = directory.transaction("owner", "readwrite");
+      const owners = transaction.objectStore("owner");
+      const claimed: unknown = await answer(owners.get(0));
+
+      if (typeof claimed !== "string") {
+        owners.put(who, 0);
+      }
+
+      await committed(transaction);
+
+      return (typeof claimed === "string" ? claimed : who) === who
+        ? options.name
+        : `${options.name}~${who}`;
+    } finally {
+      directory.close();
+    }
+  };
+
+  const disk = copy().then((name) =>
+    indexedReplica({
+      factory: env.indexedDB,
+      name,
+      version: options.replica.version,
+      tables: options.replica.tables,
+      empty: options.replica.empty,
+      server: api.server,
+      pending: options.replica.pending ?? api.pending,
+      ...(options.replica.legacy === undefined ? {} : { legacy: options.replica.legacy }),
+      ...(options.replica.lifts === undefined ? {} : { lifts: options.replica.lifts }),
+    })
+  );
+
+  // Its failure is the load's to report.
+  void disk.catch(() => undefined);
 
   const events: { name: string; at: string; attributes?: Attributes }[] = [];
 
@@ -227,18 +283,48 @@ export function createRuntime<
   let reloaded = false;
   let painted = false;
 
+  /** The cookie names someone else now (another tab signed them in): reload into their copy, once. */
+  const away = (): boolean => {
+    if (current() === who) {
+      return false;
+    }
+
+    if (!reloaded) {
+      reloaded = true;
+      env.location.reload();
+    }
+
+    return true;
+  };
+
+  const elsewhere = {
+    ok: false,
+    failure: { kind: "signed-out", message: "another person signed in here" },
+  } as const;
+
   const engine = createClient({
     sync: options.sync,
     client,
     ports: {
       storage: {
-        ...storage,
         load: async () => {
-          const loaded = await storage.load();
+          const loaded = await (await disk).load();
           // Its answer if it came while the copy loaded, else no grant yet.
           const persistent = await Promise.race([persisted, Promise.resolve(false)]);
 
           return { ...loaded, persistent };
+        },
+        commit: async (commit) => await (await disk).commit(commit),
+        keep: async (pending, max) => await (await disk).keep(pending, max),
+        drop: async (keys) => await (await disk).drop(keys),
+        // The last step before a push leaves: another person's login never sends this copy's commands.
+        mark: async (keys) => {
+          // As a copy another tab replaced: this page is leaving it.
+          if (away()) {
+            throw new Replaced();
+          }
+
+          await (await disk).mark(keys);
         },
       },
       network: {
@@ -248,12 +334,17 @@ export function createRuntime<
             return { ok: false, failure: { kind: "offline", message: "the runtime stopped" } };
           }
 
+          if (away()) {
+            return elsewhere;
+          }
+
           const result = await call(
             api.pull,
             {
               client: request.client,
               dataset: request.dataset,
               since: request.since,
+              as: who,
               ...(request.verify ? { verify: true } : {}),
               // Pages (and the commands it waits on) only when the engine asks for them, else an old server's whole copy.
               ...(request.page === undefined
@@ -264,6 +355,9 @@ export function createRuntime<
           );
 
           if (!result.ok) {
+            // A refusal for another person's login answers with their cookie.
+            away();
+
             return result;
           }
 
@@ -290,11 +384,15 @@ export function createRuntime<
             return { ok: false, failure: { kind: "offline", message: "the runtime stopped" } };
           }
 
-          const result = await call(api.push, request, {
-            fetch: env.fetch,
-            base: origin,
-            timeoutMs: options.pushTimeoutMs ?? 30_000,
-          });
+          const result = await call(
+            api.push,
+            { ...request, as: who },
+            { fetch: env.fetch, base: origin, timeoutMs: options.pushTimeoutMs ?? 30_000 }
+          );
+
+          if (!result.ok) {
+            away();
+          }
 
           return result.ok
             ? {
@@ -360,6 +458,10 @@ export function createRuntime<
   const intervals: (() => void)[] = [];
 
   const visibility = () => {
+    if (away()) {
+      return;
+    }
+
     const visible = env.document.visibilityState === "visible";
     engine.dispatch({ type: "visible", visible, now: env.now() });
 
@@ -426,6 +528,8 @@ export function createRuntime<
 
   return {
     client,
+    /** Whose copy this is (`""`: nobody's): an app keys its own storage on the device (drafts, settings) by it. */
+    who,
     model: engine.model,
     subscribe: (listener: (model: Model<T, S, C, O>) => void): (() => void) => {
       listeners.add(listener);
@@ -444,7 +548,11 @@ export function createRuntime<
       engine.start();
       connect(0);
       intervals.push(
-        env.setInterval(() => engine.dispatch({ type: "tick", now: env.now() }), TICK_MS),
+        env.setInterval(() => {
+          if (!away()) {
+            engine.dispatch({ type: "tick", now: env.now() });
+          }
+        }, TICK_MS),
         env.setInterval(() => {
           void flush().catch(() => undefined);
         }, FLUSH_MS)
@@ -467,13 +575,22 @@ export function createRuntime<
       socket = undefined;
       open?.close();
     },
-    command: (command: C): void => engine.command(command),
+    /** A tap, kept for this copy's person; none on a page leaving for another person's copy. */
+    command: (command: C): void => {
+      if (!away()) {
+        engine.command(command);
+      }
+    },
     /** The person is done with a finished command: it leaves the page and this device's outbox. */
     dismiss: (command: { client: string; id: number }): void =>
       engine.dispatch({ type: "dismiss", client: command.client, id: command.id, now: env.now() }),
-    /** Drop this device's copy (the server keeps everything) and start over. */
+    /** Drop this person's copy on this device (the server keeps everything) and start over. */
     forget: (): Promise<void> => {
-      const forgetting = storage.forget().then(() => env.location.reload());
+      const forgetting = disk.then(async (each) => {
+        await each.forget();
+        env.location.reload();
+      });
+
       pending.add(forgetting);
       void forgetting
         .finally(() => {

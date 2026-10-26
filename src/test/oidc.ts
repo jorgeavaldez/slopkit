@@ -1,6 +1,6 @@
 /**
  * An OpenID provider on loopback that approves every authorization at once: discovery, keys, and a token endpoint that
- * checks the PKCE verifier and signs an ID token for one fixed subject. For tests and local development only.
+ * checks the PKCE verifier and signs an ID token for its subject (`as` changes it). For tests and local development only.
  */
 import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
@@ -24,9 +24,13 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.end(JSON.stringify(value));
 }
 
-export async function identityProvider(
-  subject = "owner"
-): Promise<{ issuer: string; close: () => Promise<void> }> {
+export async function identityProvider(subject = "owner"): Promise<{
+  issuer: string;
+  /** Signs the next sign-ins in as this subject. */
+  as: (next: string) => void;
+  close: () => Promise<void>;
+}> {
+  let current = subject;
   const { privateKey, publicKey } = await generateKeyPair("RS256");
   const jwk = { ...(await exportJWK(publicKey)), kid: "test", alg: "RS256", use: "sig" };
   const codes = new Map<string, { challenge: string; nonce: string; client: string }>();
@@ -81,7 +85,7 @@ export async function identityProvider(
         const idToken = await new SignJWT({ nonce: code.nonce })
           .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
           .setIssuer(issuer)
-          .setSubject(subject)
+          .setSubject(current)
           .setAudience(code.client)
           .setIssuedAt()
           .setExpirationTime("1h")
@@ -108,6 +112,9 @@ export async function identityProvider(
 
   return {
     issuer,
+    as: (next) => {
+      current = next;
+    },
     close: () =>
       new Promise((resolve) => {
         server.close(() => resolve());

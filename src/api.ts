@@ -42,10 +42,16 @@ const RESERVED = new Set([
 /** Each row key's list, as a pull reply carries them. */
 export type Rows<R> = { [K in keyof R]: R[K][] };
 
+/**
+ * `as`: whose copy asks (the page's `<name>_who` cookie, `whoOf` of their identities): the server refuses one that
+ * isn't the caller's, so nothing of one person's copy is ever sent or applied under another's login. Absent for a
+ * caller with no copy (an agent's key) and from a page of an earlier release.
+ */
 export type PullRequest = {
   client: string;
   dataset: string | null;
   since: number;
+  as?: string;
   verify?: boolean;
   page?: string | null;
   commands?: { client: string; id: number }[];
@@ -65,6 +71,8 @@ export type PushRequest<C> = {
   client: string;
   dataset: string | null;
   since: number;
+  /** Whose copy's commands these are (`PullRequest.as`). */
+  as?: string;
   commands: { id: number; command: C }[];
 };
 
@@ -96,6 +104,10 @@ export type SyncApi<R, S, C, O> = {
 
 const revision = number({ integer: true, min: 0 });
 const client = string({ pattern: /^[A-Za-z0-9_-]{8,64}$/ });
+
+/** Whose copy a request is for (`PullRequest.as`); empty for a page that knows of no one. */
+const person = string({ max: 64 });
+
 const commandId = number({ integer: true, min: 1 });
 const cursor = string({ min: 1, max: 1000 });
 
@@ -164,6 +176,7 @@ export function syncApi<R extends Record<string, { id: string | number }>, S, C,
         client,
         dataset: nullable(dataset),
         since: revision,
+        as: optional(person),
         verify: optional(boolean()),
         page: optional(nullable(cursor)),
         commands: optional(
@@ -190,6 +203,7 @@ export function syncApi<R extends Record<string, { id: string | number }>, S, C,
         client,
         dataset: nullable(dataset),
         since: revision,
+        as: optional(person),
         commands: array(object({ id: commandId, command: definition.command }, { strict: true }), {
           max: PUSH_MAX,
         }),
