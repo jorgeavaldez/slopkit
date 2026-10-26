@@ -451,6 +451,7 @@ function runtimeOptions(f: ReturnType<typeof fixture>, host: string) {
     socket: () => ({ onopen: null, onmessage: null, onclose: null, close: () => {} }),
     location: { protocol: "http:", host, reload: () => {} },
     document: {
+      cookie: `replica-upgrade_who=${createHash("sha256").update("key:fixture").digest("base64url").slice(0, 22)}`,
       visibilityState: "visible",
       addEventListener: () => {},
       removeEventListener: () => {},

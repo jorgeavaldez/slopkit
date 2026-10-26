@@ -1257,13 +1257,13 @@ test("two people opening together cannot both claim the earlier release's databa
 
 test("nobody keeps no rows or final commands, acts on nothing, and reloads once when the cookie names someone", async () => {
   const factory = new IDBFactory();
-  await legacyCopy(factory, "nobody-phone");
+  await legacyCopy(factory, "notes");
 
   const h = await harness({
     factory,
-    name: "nobody-phone",
+    name: "notes",
     person: true,
-    cookie: "nobody-phone_who_else=decoy",
+    cookie: "notes_who_else=decoy",
     offline: true,
   });
 
@@ -1398,7 +1398,7 @@ test("a cookie change before a pull blocks it, even when a socket owes newer row
 });
 
 test("a refused call that corrects the cookie reloads instead of showing the other caller's rows", async () => {
-  const h = await harness({ person: true, cookie: `runtime-fixture_who=${firstWho}` });
+  const h = await harness({ name: "notes", person: true, cookie: `notes_who=${firstWho}` });
 
   try {
     h.store.put("other-person-row", 7);
