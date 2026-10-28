@@ -67,12 +67,20 @@ export const CORE_TABLES = `create table meta(key text primary key, value text n
    insert into meta(key, value) values ('revision', '1'), ('history_floor', '1'),
      ('dataset', lower(hex(randomblob(12))));`;
 
-/** A replicated table's triggers: every write carries the revision stamped in its own transaction; no delete. */
+/** A replicated table's triggers, by name after the table's. */
+const TRIGGERS = ["stamped_insert", "stamped_update", "never_deleted"] as const;
+
+/**
+ * A replicated table's triggers: every write carries the revision stamped in its own transaction; no delete. Trigger
+ * names are the database's and a rename keeps them on the renamed table, so they're dropped first: a table that took
+ * a replicated table's name gets them, never silently none.
+ */
 function stamped(table: string): string {
   const revision = "(select cast(value as integer) from meta where key = 'revision')";
   const stamping = "(select cast(value as integer) from meta where key = 'stamping')";
 
   return [
+    ...TRIGGERS.map((trigger) => `drop trigger if exists ${table}_${trigger};`),
     ...["insert", "update"].map(
       (event) => `create trigger ${table}_stamped_${event} before ${event} on ${table}
      when new.revision is not ${revision} or ${revision} is not ${stamping}
@@ -87,7 +95,10 @@ function stamped(table: string): string {
 export type StoreSchema = {
   /** The app's tables as a new store starts them (the core tables come first, made by the kit). */
   base: string;
-  /** Tables a replica holds: stamped and never deleted, by trigger. */
+  /**
+   * Tables a replica holds: stamped and never deleted, by trigger. The kit makes the triggers for each, whether the
+   * base or a migration makes the table, and again on a table a migration rebuilds.
+   */
   replicated: readonly string[];
   baseVersion: number;
   /** Each moves the schema one version up from `baseVersion`; never edit a shipped one, append. */
@@ -182,11 +193,7 @@ export class SyncStore {
       this.transaction(() => {
         this.db.exec(CORE_TABLES);
         this.db.exec(schema.base);
-
-        for (const table of schema.replicated) {
-          this.db.exec(stamped(table));
-        }
-
+        this.stampTables(schema);
         this.db.exec(`pragma user_version = ${schema.baseVersion}`);
       });
     }
@@ -206,6 +213,8 @@ export class SyncStore {
       try {
         this.transaction(() => {
           this.db.exec(schema.migrations[next - schema.baseVersion] ?? "");
+          // A table this migration made or rebuilt is stamped in the transaction that made it.
+          this.stampTables(schema);
           this.db.exec(`pragma user_version = ${next + 1}`);
           const broken = this.db.prepare("pragma foreign_key_check").all();
 
@@ -218,8 +227,51 @@ export class SyncStore {
       }
     }
 
+    // Every replicated table exists by now. One an earlier release migrated may be unstamped: stamped here, writing
+    // only then, so opening a store another process is writing to doesn't wait on it.
+    const { missing, unstamped } = this.replicatedTables(schema);
+
+    if (missing.length > 0) {
+      throw new Error(`Replicated tables the schema never makes: ${missing.join(", ")}`);
+    }
+
+    if (unstamped.length > 0) {
+      this.transaction(() => this.stampTables(schema));
+    }
+
     if (schema.indexes !== undefined) {
       this.db.exec(schema.indexes);
+    }
+  }
+
+  /** The replicated tables that don't exist yet, and those that exist without all their triggers. */
+  private replicatedTables(schema: StoreSchema) {
+    const exists = this.db.prepare("select 1 from sqlite_master where type = 'table' and name = ?");
+
+    const triggers = this.db.prepare(
+      "select count(*) as n from sqlite_master where type = 'trigger' and tbl_name = ? and name in (?, ?, ?)"
+    );
+
+    const missing: string[] = [];
+    const unstamped: string[] = [];
+
+    for (const table of schema.replicated) {
+      if (exists.get(table) === undefined) {
+        missing.push(table);
+      } else if (
+        triggers.get(table, ...TRIGGERS.map((trigger) => `${table}_${trigger}`))?.n !== 3
+      ) {
+        unstamped.push(table);
+      }
+    }
+
+    return { missing, unstamped };
+  }
+
+  /** Stamp every replicated table that exists now and isn't yet. */
+  private stampTables(schema: StoreSchema): void {
+    for (const table of this.replicatedTables(schema).unstamped) {
+      this.db.exec(stamped(table));
     }
   }
 
