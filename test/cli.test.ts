@@ -60,12 +60,14 @@ beforeAll(async () => {
   const migrated = await pack(fixtureHome, VERSION_MIGRATED, 2);
   const broken = await pack(fixtureHome, "1.2.0", 1, "throw");
   const degraded = await pack(fixtureHome, "1.3.0", 1, "degraded");
+  const strict = await pack(fixtureHome, "1.4.0", 1, "strict-store");
   releases = new Map([
     ["v1.0.0", first],
     ["v1.1.0", second],
     ["v2.0.0", migrated],
     ["v1.2.0", broken],
     ["v1.3.0", degraded],
+    ["v1.4.0", strict],
     ["edge", second],
   ]);
   releaseServer = await mirror(releases);
@@ -454,6 +456,141 @@ test("rollback crossing a migration refuses without --with-store, then restores 
     ]);
   } finally {
     old.close();
+  }
+});
+
+/** A home whose store lives in a data directory outside it (`NOTEBOOK_DATA`), as the app's `store` option says. */
+async function dataApp() {
+  const h = await app();
+  const data = join(h.base, "data");
+  const store = join(data, "store", "notebook.sqlite");
+  const env = { NOTEBOOK_DATA: data };
+
+  return {
+    ...h,
+    data,
+    store,
+    run: (args: string[]) => h.run(args, env),
+    start: () => h.start(env),
+  };
+}
+
+function rowsAt(path: string) {
+  const db = new DatabaseSync(path, { readOnly: true });
+
+  try {
+    return structuredClone(db.prepare("select id,value from notes order by id").all());
+  } finally {
+    db.close();
+  }
+}
+
+async function checkedRows(proof: string, version: string) {
+  return (await readFile(proof, "utf-8"))
+    .trim()
+    .split("\n")
+    .map((line) =>
+      object({
+        version: string(),
+        home: string(),
+        rows: array(object({ id: string(), value: string() })),
+      }).parse(JSON.parse(line))
+    )
+    .filter((line) => line.version === version);
+}
+
+test("update boot-checks a copy of the store the app keeps outside its home", async () => {
+  const h = await dataApp();
+  const proof = join(h.base, "proof.jsonl");
+  await config(h.home, { proof });
+  expect((await h.run(["seed", "kept", "in the data directory"])).code).toBe(0);
+
+  expect((await h.run(["update", VERSION_TWO])).code).toBe(0);
+
+  const [checked] = await checkedRows(proof, VERSION_TWO);
+  expect(checked?.home).not.toBe(h.home);
+  expect(checked?.rows).toStrictEqual([{ id: "kept", value: "in the data directory" }]);
+  expect(rowsAt(h.store)).toStrictEqual([{ id: "kept", value: "in the data directory" }]);
+  expect(existsSync(join(h.home, "notebook.sqlite"))).toBe(false);
+});
+
+test("rollback crossing a migration restores the copy kept beside a store outside the home", async () => {
+  const h = await dataApp();
+  expect((await h.run(["seed", "before", "original"])).code).toBe(0);
+  expect((await h.run(["update", VERSION_MIGRATED])).code).toBe(0);
+  const server = h.start();
+
+  try {
+    await server.line(/^notebook ready/);
+  } finally {
+    await server.stop();
+  }
+
+  expect(existsSync(`${h.store}.schema-1.bak`)).toBe(true);
+  expect((await h.run(["seed", "after", "after migration"])).code).toBe(0);
+
+  const refused = await h.run(["rollback"]);
+  expect(refused.code).toBe(1);
+  expect(refused.out + refused.err).toContain("notebook.sqlite.schema-1.bak");
+  expect((await h.package()).version).toBe(VERSION_MIGRATED);
+
+  expect((await h.run(["rollback", "--with-store"])).code).toBe(0);
+  expect((await h.package()).version).toBe(VERSION_ONE);
+  expect(rowsAt(h.store)).toStrictEqual([{ id: "before", value: "original" }]);
+  expect(existsSync(`${h.store}.schema-1.bak`)).toBe(false);
+  expect(
+    (await readdir(join(h.data, "store"))).filter((file) =>
+      file.startsWith("notebook.sqlite.rolled-back-")
+    )
+  ).toHaveLength(1);
+  expect(existsSync(join(h.home, "notebook.sqlite"))).toBe(false);
+});
+
+test("a release whose store needs its environment still reports itself, so an update keeps its records", async () => {
+  const h = await dataApp();
+  expect((await h.run(["seed", "kept", "in the data directory"])).code).toBe(0);
+
+  expect((await h.run(["update", "1.4.0"])).code).toBe(0);
+
+  expect((await h.package()).version).toBe("1.4.0");
+  expect(await record(h.home, "current.json")).toStrictEqual({ version: "1.4.0", schema: 1 });
+  expect(await record(h.home, "installed.json")).toMatchObject({ version: "1.4.0", via: "update" });
+  expect(JSON.parse((await h.run(["version", "--json"])).out)).toStrictEqual({
+    version: "1.4.0",
+    schema: 1,
+  });
+});
+
+test("a page's update checks and records its job in a store outside the home", async () => {
+  const h = await dataApp();
+  const proof = join(h.base, "proof.jsonl");
+  await config(h.home, { proof, release: VERSION_TWO });
+  expect((await h.run(["seed", "kept", "in the data directory"])).code).toBe(0);
+  const server = h.start();
+
+  try {
+    const url = readyUrl(await server.line(/^notebook ready · /));
+    expect((await fetch(new URL("/update", url), { method: "POST" })).status).toBe(200);
+    await server.line(/^fixture serving 1\.1\.0 · /);
+
+    const checks = (await checkedRows(proof, VERSION_TWO)).filter((line) => line.home !== h.home);
+    expect(checks.map((line) => line.rows)).toStrictEqual([
+      [{ id: "kept", value: "in the data directory" }],
+    ]);
+    expect(existsSync(join(h.home, "notebook.sqlite"))).toBe(false);
+    const db = new DatabaseSync(h.store, { readOnly: true });
+
+    try {
+      expect(
+        structuredClone(db.prepare("select state,result from jobs where kind='update'").all())
+      ).toStrictEqual([
+        { state: "done", result: JSON.stringify({ release: VERSION_TWO, from: VERSION_ONE }) },
+      ]);
+    } finally {
+      db.close();
+    }
+  } finally {
+    await server.stop();
   }
 });
 

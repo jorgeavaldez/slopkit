@@ -110,29 +110,31 @@ function execute(command: string, args: string[], env: NodeJS.ProcessEnv) {
   return launch(command, args, env).finished;
 }
 
-function source(schema: number, behavior: "ok" | "throw" | "degraded") {
+function source(schema: number, behavior: "ok" | "throw" | "degraded" | "strict-store") {
   return `#!/usr/bin/env node
 import { createServer } from 'node:http';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { runCli, askUpdate, beginUpdate, recoverUpdate, settleAskedUpdates } from ${JSON.stringify(cliModule)};
 import { SyncStore } from ${JSON.stringify(storeModule)};
 const root = new URL('./', import.meta.url);
 const pkg = JSON.parse(readFileSync(new URL('package.json', root), 'utf8'));
 const VERSION = pkg.version;
 const SCHEMA = { base: 'create table notes(id text primary key, value text not null, deleted integer not null default 0, revision integer not null) strict;', replicated: ['notes'], baseVersion: 1, migrations: ${JSON.stringify(schema === 1 ? [] : ["alter table notes add column extra text;"])}, indexes: '' };
-const open = home => new SyncStore(join(home, 'notebook.sqlite'), { name: 'notebook', schema: SCHEMA });
+// NOTEBOOK_DATA keeps the store outside the home, as an app with a data directory does.
+const storeOf = (home, env) => env.NOTEBOOK_DATA ? join(env.NOTEBOOK_DATA, 'store', 'notebook.sqlite') : join(home, 'notebook.sqlite');
+const open = path => { mkdirSync(dirname(path), { recursive: true, mode: 0o700 }); return new SyncStore(path, { name: 'notebook', schema: SCHEMA }); };
 const jobsFor = store => store.createJobs({ encode: JSON.stringify, decode: JSON.parse });
 const options = {
-  name: 'notebook', root, schema: ${schema}, serves: 'fixture notes.',
+  name: 'notebook', root, schema: ${schema}, serves: 'fixture notes.', store: ({ home, env }) => { if (${JSON.stringify(behavior)} === 'strict-store' && !env.NOTEBOOK_DATA) { throw new Error('fixture store needs NOTEBOOK_DATA'); } return storeOf(home, env); },
   ...(process.env.NOTEBOOK_PROVEN_MS ? { provenAfterMs: Number(process.env.NOTEBOOK_PROVEN_MS) } : {}),
   commands: {
     custom: { usage: 'custom <words>', help: 'writes fixture arguments', run: async (args, home) => { writeFileSync(join(home, 'custom.json'), JSON.stringify(args)); return 7; } },
     seed: { usage: 'seed <id> <value>', help: 'seeds fixture notes', run: async (args, home) => {
-      mkdirSync(home, { recursive: true, mode: 0o700 }); const store = open(home); store.transaction(() => { const revision = store.stamp(); store.db.prepare('insert into notes(id,value,revision) values (?,?,?)').run(args[0], args[1], revision); }); store.close(); return 0;
+      mkdirSync(home, { recursive: true, mode: 0o700 }); const store = open(storeOf(home, process.env)); store.transaction(() => { const revision = store.stamp(); store.db.prepare('insert into notes(id,value,revision) values (?,?,?)').run(args[0], args[1], revision); }); store.close(); return 0;
     } },
     'hold-wal': { usage: 'hold-wal', help: 'keeps fixture WAL live', run: async (args, home) => {
-      const store = open(home);
+      const store = open(storeOf(home, process.env));
       store.db.exec('pragma wal_autocheckpoint=0');
       // A signal listener alone cannot keep Node alive; retain the Store through an active server.
       const holder = createServer((_request, response) => response.end(String(store.revision())));
@@ -152,9 +154,9 @@ const options = {
       return 0;
     } },
   },
-  serve: async ({ home, version, say, web, env, update }) => {
+  serve: async ({ home, version, say, web, env, update, store: storePath }) => {
     if (${JSON.stringify(behavior)} === 'throw') { throw new Error("fixture won't start"); }
-    const store = open(home); const jobs = jobsFor(store);
+    const store = open(storePath ?? storeOf(home, env)); const jobs = jobsFor(store);
     jobs.interrupt(job => recoverUpdate(job, version)); settleAskedUpdates(jobs);
     const config = (() => { try { return JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')); } catch { return {}; } })();
     const observeEnvironment = phase => {
@@ -239,7 +241,7 @@ export async function pack(
   parent: string,
   version: string,
   schema = 1,
-  behavior: "ok" | "throw" | "degraded" = "ok"
+  behavior: "ok" | "throw" | "degraded" | "strict-store" = "ok"
 ): Promise<Release> {
   const root = join(parent, `source-${version}`);
   await mkdir(root, { recursive: true });
