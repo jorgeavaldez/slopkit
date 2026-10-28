@@ -1593,13 +1593,15 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
         const before = prior(at, msg.client);
         const effects: E[] = [];
 
-        // The server's own refusal of a request it never ran (its schema is checked before the handler, and a handler
-        // never refuses after anything acted): this attempt didn't act, though an earlier one may have.
+        // The server's own refusal of a request it never ran (its schema and the caller are checked before the
+        // handler, and a handler never refuses after anything acted): this attempt didn't act, though an earlier one may
+        // have.
         const refused =
           failure.refused === true &&
           (failure.kind === "invalid" ||
             failure.kind === "forbidden" ||
-            failure.kind === "conflict");
+            failure.kind === "conflict" ||
+            failure.kind === "signed-out");
 
         // A schema refusal naming one of this push's commands is that command's alone.
         const index = refused && failure.kind === "invalid" ? commandAt(failure.path) : undefined;
@@ -1622,14 +1624,15 @@ export function createSync<T, P, S, C, O>(spec: Spec<T, P, S, C, O>) {
 
           // A kit forbidden or conflict: nothing in this attempt acted. Final only for a command no attempt of which
           // may have acted.
-          if (refused && failure.kind !== "invalid") {
+          if (refused && (failure.kind === "forbidden" || failure.kind === "conflict")) {
             return doubt
               ? { ...each, state: was }
               : refuse(each, false, failure.message, now, effects);
           }
 
-          // An envelope refusal (a page and server of different releases): nothing acted, and the page stops. The disk
-          // holds the in-flight mark: a command never uncertain is kept as it was again.
+          // An envelope refusal (a page and server of different releases), or the kit's signed-out (a lapsed login, or
+          // a copy that is another person's): nothing acted, nothing is final, and the page stops until its person acts.
+          // The disk holds the in-flight mark: a command never uncertain is kept as it was again.
           if (refused) {
             const restored: Pending<C, O> = { ...each, state: was };
 

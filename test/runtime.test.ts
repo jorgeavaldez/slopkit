@@ -208,17 +208,32 @@ async function harness(
       });
     }
 
+    // The server can close under a request still in flight at the harness's close: the page sees the link drop.
     const upstream = await fetch(`${f.server.url}${request.url}`, {
       method: request.method ?? "GET",
       headers: { ...identityHeaders, "content-type": "application/json" },
       ...(text ? { body: text } : {}),
-    });
+    }).catch(() => undefined);
+
+    if (upstream === undefined) {
+      response.destroy();
+
+      return;
+    }
+
+    const reply = await upstream.arrayBuffer().catch(() => undefined);
+
+    if (reply === undefined) {
+      response.destroy();
+
+      return;
+    }
 
     response.writeHead(upstream.status, {
       "content-type": upstream.headers.get("content-type") ?? "application/json",
       "set-cookie": upstream.headers.getSetCookie(),
     });
-    response.end(Buffer.from(await upstream.arrayBuffer()));
+    response.end(Buffer.from(reply));
 
     if (url.pathname === "/api/telemetry") {
       onTelemetrySent?.();

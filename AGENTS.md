@@ -29,7 +29,8 @@ or the kit's own tests in `test/`.
 - Nothing is sent before it is kept, and no push before it is kept as in flight; observed and saved revisions are
   separate; a pull is owed while the server is ahead, whatever the socket says; the push channel only pokes (`sync`).
   A push carries the revision each command was tapped against, so a server can refuse intents made on a history it no
-  longer has. Successive pulls name every command still waiting, a push's worth at a time.
+  longer has. Successive pulls name every command still waiting, a push's worth at a time. A push the kit refuses before
+  anything ran (another release's envelope, a signed-out caller) puts its commands back as they were.
 - A copy never claims more history than it holds (`sync`): complete, or partial with every row at or above its cursor
   and `through`. A delta applies only when `since ≤ copy.revision ≤ reply.revision` on the same dataset; only a reset
   replaces the copy; the cursor moves only on a reply to the copy's own `next`; a partial copy owes its next page, with

@@ -214,15 +214,18 @@ Performance is a requirement, aimed at the limits of every service and system in
   an explicit "forget this device".
 - **The server runs itself:** one compiled binary with one start command and one config, updating itself, doing its
   background work as durable jobs and syncing on a cron-style schedule.
-- **Agent access.** An agent can run any query against an app's data through its API, and the API is built to extend.
+- **Agent access.** An agent can run any query against an app's data through its API, with the app's keys or the
+  proxy's service tokens, never a person's login, and the API is built to extend.
 - **Dependencies.** Few, from `DEPS.md`, so apps stay small. Few never means hand-rolled crypto, JWT, protocol parsers
   or weaker storage semantics: those use a vetted library (for example `jose`).
 - **Defaults:** IndexedDB in the browser (SQLite in the browser only where demonstrably better); SQLite on the server;
   logins to outside accounts added in the UI.
-- **Its own login.** An app signs people in itself, with OpenID Connect, and serves on a local binding. An
-  identity-aware proxy in front (Cloudflare Access's signed header) is an optional outer door, never the app's login.
-  A test identity (the kit's OIDC stand-in) signs in on a test home, so the app is proven end to end without a real
-  login.
+- **Login.** An app serves on a local binding and takes who a person is from the identity-aware proxy in front of it
+  (Cloudflare Access's signed header), or from its own OpenID Connect login only where nothing is in front. That door
+  is the kit's code, proven in the kit, so an app relies on it rather than testing it; what each caller may do stays
+  the app's to test. Any local or test run can override the login (the kit's test login, or a key set for the run),
+  so an app is proven end to end locally, with no real login, proxy or identity provider; a live home never takes
+  the test login.
 - **Look.** Brutalist, mobile-first PWAs: dense, monospace, black and white, no shadows or rounded corners.
 - Shipped source is generic: no hostnames, accounts or private data in code or docs; private data lives in the app's
   data directory and configuration.

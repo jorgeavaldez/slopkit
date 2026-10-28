@@ -1,6 +1,6 @@
 {
   "name": "slopkit",
-  "version": "0.4.0-rc.5",
+  "version": "0.4.0-rc.6",
   "description": "Opinionated standards and libraries for fast, local-first personal software: state machines, exhaustive state tables, sync, a command ledger, jobs, a guarded server, and the conformance suite that proves them",
   "keywords": [
     "conformance",
