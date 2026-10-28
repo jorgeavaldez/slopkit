@@ -187,9 +187,27 @@ const options = {
     if (config.manualReady) { console.log('fixture waiting · ' + url); await gate; }
     if (${JSON.stringify(behavior)} === 'degraded') { console.log('notebook degraded: web off: fixture cannot serve'); }
     say('info', 'fixture started', { version }); console.log('fixture serving ' + version + ' · ' + url + ' · ' + process.pid);
+    let extra;
     return { ...(config.withoutUrl ? {} : { url }),
+      // Without configured work this remains an older app's no-start return, for the existing install checks.
+      ...(config.startProvider || config.startProof || config.startPort !== undefined || config.startFailure ? { start: () => {
+        if (config.startFailure === 'throw') { throw new Error('fixture start threw'); }
+        return (async () => {
+          if (config.startProvider) {
+            const target = new URL(config.startProvider); target.searchParams.set('version', version); target.searchParams.set('home', home);
+            const reply = await fetch(target, { method: 'POST' });
+            if (!reply.ok) { throw new Error('fixture provider refused start'); }
+          }
+          if (config.startPort !== undefined) {
+            extra = createServer((_request, response) => response.end('app work listener ' + version));
+            await new Promise((resolve, reject) => { extra.once('error', reject); extra.listen(config.startPort, '127.0.0.1', resolve); });
+          }
+          if (config.startFailure === 'reject') { throw new Error('fixture start rejected'); }
+          if (config.startProof) { appendFileSync(config.startProof, JSON.stringify({ version, home }) + '\\n'); }
+        })();
+      } } : {}),
       claim: () => { const claimed = beginUpdate(jobs, version); appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'claim', claimed, state: claimed ? jobs.get(claimed.id)?.state : null }) + '\\n'); return claimed; },
-      close: async () => { const open = jobs.open('update')[0]; appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'close', state: open?.state }) + '\\n'); await new Promise(resolve => server.close(resolve)); store.close(); say('info', 'fixture stopped'); },
+      close: async () => { const open = jobs.open('update')[0]; appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'close', state: open?.state }) + '\\n'); if (extra?.listening) { await new Promise(resolve => extra.close(resolve)); } await new Promise(resolve => server.close(resolve)); store.close(); say('info', 'fixture stopped'); },
     };
   },
 };
