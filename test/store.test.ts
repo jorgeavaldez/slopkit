@@ -303,6 +303,127 @@ test("replicated insert/update must carry this transaction's stamp; even a stamp
   }
 });
 
+const ROWS =
+  "(id text primary key, value integer not null, deleted integer not null default 0, revision integer not null) strict";
+
+/** How a write ends: "done", or which trigger refused it. */
+function ending(write: () => void) {
+  try {
+    write();
+
+    return "done";
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
+    return message.includes("stamped in its own transaction")
+      ? "not stamped"
+      : message.includes("never deleted")
+        ? "never deleted"
+        : message;
+  }
+}
+
+/** How each kind of write to `table` ends. */
+function writes(store: SyncStore, table: string) {
+  return {
+    unstamped: ending(() => store.db.exec(`insert into ${table} values ('a',1,0,1)`)),
+    stamped: ending(() =>
+      store.transaction(() => {
+        store.db.prepare(`insert into ${table} values ('a',1,0,?)`).run(store.stamp());
+      })
+    ),
+    update: ending(() => store.db.exec(`update ${table} set value=2 where id='a'`)),
+    delete: ending(() => store.db.exec(`delete from ${table}`)),
+  };
+}
+
+/** What the stamping triggers hold a replicated table to: only stamped writes, and no delete. */
+const STAMPED = {
+  unstamped: "not stamped",
+  stamped: "done",
+  update: "not stamped",
+  delete: "never deleted",
+};
+
+test("a replicated table a migration adds is stamped, on a new store and on one migrating to it", () => {
+  const added = {
+    ...SCHEMA,
+    replicated: [...SCHEMA.replicated, "added"],
+    migrations: [`create table added${ROWS};`],
+  };
+
+  expect(writes(open(path(), added), "added")).toStrictEqual(STAMPED);
+
+  const file = path();
+  open(file).close();
+  expect(writes(open(file, added), "added")).toStrictEqual(STAMPED);
+});
+
+test("a migration that rebuilds a replicated table leaves it stamped", () => {
+  const file = path();
+  open(file).close();
+
+  const store = open(file, {
+    ...SCHEMA,
+    migrations: [
+      `create table history_new${ROWS};
+       insert into history_new select * from history;
+       drop table history;
+       alter table history_new rename to history;`,
+    ],
+  });
+
+  expect(writes(store, "history")).toStrictEqual(STAMPED);
+});
+
+test("a table that takes a replicated table's name after it's renamed away is stamped, and so is the renamed one", () => {
+  const file = path();
+  open(file).close();
+
+  const schema = {
+    ...SCHEMA,
+    replicated: [...SCHEMA.replicated, "archived"],
+    migrations: [`alter table history rename to archived; create table history${ROWS};`],
+  };
+
+  const store = open(file, schema);
+  expect(writes(store, "history")).toStrictEqual(STAMPED);
+  expect(writes(store, "archived")).toStrictEqual(STAMPED);
+  store.close();
+  expect(writes(open(file, schema), "history")).toMatchObject({
+    unstamped: "not stamped",
+    delete: "never deleted",
+  });
+});
+
+test("opening a stamped store doesn't wait on another connection's write", () => {
+  const file = path();
+  open(file).close();
+  const writer = new DatabaseSync(file);
+
+  try {
+    writer.exec("begin immediate");
+    expect(open(file).revision()).toBe(1);
+  } finally {
+    writer.exec("rollback");
+    writer.close();
+  }
+});
+
+test("a replicated table the schema never makes is refused at open, naming it", () => {
+  const missing = {
+    ...SCHEMA,
+    replicated: [...SCHEMA.replicated, "missing"],
+    migrations: ["select 1"],
+  };
+
+  expect(() => open(path(), missing)).toThrow(/missing/);
+
+  const file = path();
+  open(file).close();
+  expect(() => open(file, missing)).toThrow(/missing/);
+});
+
 test("known includes the floor, head and logged revisions but not lost holes above the floor", () => {
   const store = open(path());
   const r = store.transaction(() => store.stamp());
