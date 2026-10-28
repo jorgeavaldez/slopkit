@@ -113,7 +113,7 @@ function execute(command: string, args: string[], env: NodeJS.ProcessEnv) {
 function source(schema: number, behavior: "ok" | "throw" | "degraded") {
   return `#!/usr/bin/env node
 import { createServer } from 'node:http';
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runCli, askUpdate, beginUpdate, recoverUpdate, settleAskedUpdates } from ${JSON.stringify(cliModule)};
 import { SyncStore } from ${JSON.stringify(storeModule)};
@@ -157,6 +157,10 @@ const options = {
     const store = open(home); const jobs = jobsFor(store);
     jobs.interrupt(job => recoverUpdate(job, version)); settleAskedUpdates(jobs);
     const config = (() => { try { return JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')); } catch { return {}; } })();
+    const observeEnvironment = phase => {
+      if (config.environmentProof) { appendFileSync(config.environmentProof, JSON.stringify({ phase, version, home, mark: process.env.SLOPKIT_BOOT_CHECK ?? null, contextMark: env.SLOPKIT_BOOT_CHECK ?? null }) + '\\n'); }
+    };
+    observeEnvironment('serve');
     const rows = store.db.prepare('select id,value from notes order by id').all();
     if (config.proof) { appendFileSync(config.proof, JSON.stringify({ version, home, env: Object.keys(env).sort(), rows, web, pid: process.pid }) + '\\n'); }
     let releaseReady; const gate = new Promise(resolve => { releaseReady = resolve; });
@@ -176,6 +180,7 @@ const options = {
         response.setHeader('content-type', 'application/json'); response.end(body ?? JSON.stringify({ kind: 'signed-out' })); return;
       }
       if (request.url === '/gate') { response.end('released'); releaseReady(); return; }
+      if (request.url === '/stop-start') { response.end('update requested'); update(); return; }
       if (request.url === '/update') { const asked = askUpdate(jobs, config.release || 'edge', version, { client: 'fixture_page', id: 1 }); response.on('finish', () => update()); response.setHeader('content-type', 'application/json'); response.end(JSON.stringify(asked)); return; }
       response.setHeader('content-type', 'application/json'); response.end(JSON.stringify({ version, rows, pid: process.pid }));
     });
@@ -190,9 +195,15 @@ const options = {
     let extra;
     return { ...(config.withoutUrl ? {} : { url }),
       // Without configured work this remains an older app's no-start return, for the existing install checks.
-      ...(config.startProvider || config.startProof || config.startPort !== undefined || config.startFailure ? { start: () => {
+      ...(config.startProvider || config.startProof || config.startPort !== undefined || config.startFailure || config.holdStart || config.environmentProof ? { start: () => {
+        observeEnvironment('start');
         if (config.startFailure === 'throw') { throw new Error('fixture start threw'); }
         return (async () => {
+          if (config.holdStart) {
+            process.once('SIGTERM', () => console.log('fixture stop noticed'));
+            console.log('fixture start held · ' + url);
+            await gate;
+          }
           if (config.startProvider) {
             const target = new URL(config.startProvider); target.searchParams.set('version', version); target.searchParams.set('home', home);
             const reply = await fetch(target, { method: 'POST' });
@@ -207,7 +218,7 @@ const options = {
         })();
       } } : {}),
       claim: () => { const claimed = beginUpdate(jobs, version); appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'claim', claimed, state: claimed ? jobs.get(claimed.id)?.state : null }) + '\\n'); return claimed; },
-      close: async () => { const open = jobs.open('update')[0]; appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'close', state: open?.state }) + '\\n'); if (extra?.listening) { await new Promise(resolve => extra.close(resolve)); } await new Promise(resolve => server.close(resolve)); store.close(); say('info', 'fixture stopped'); },
+      close: async () => { const open = jobs.open('update')[0]; appendFileSync(join(home, 'events.jsonl'), JSON.stringify({ event: 'close', state: open?.state, ...(config.holdStart ? { serving: existsSync(join(home, 'serving.json')) } : {}) }) + '\\n'); if (extra?.listening) { await new Promise(resolve => extra.close(resolve)); } await new Promise(resolve => server.close(resolve)); store.close(); say('info', 'fixture stopped'); if (config.holdStart) { console.log('fixture held start closed'); } },
     };
   },
 };

@@ -7,7 +7,7 @@ import { join } from "node:path";
 
 import { afterAll, beforeAll, expect, test } from "vitest";
 
-import { array, literal, object, string } from "../src/schema.ts";
+import { array, literal, nullable, object, string } from "../src/schema.ts";
 import type { Schema } from "../src/schema.ts";
 import { running } from "../src/server/cli.ts";
 import type { Served } from "../src/server/cli.ts";
@@ -56,6 +56,8 @@ type WorkConfig = {
   startProof?: string;
   startPort?: number;
   startFailure?: "throw" | "reject";
+  holdStart?: boolean;
+  environmentProof?: string;
 };
 
 async function configure(home: string, value: WorkConfig) {
@@ -292,3 +294,113 @@ test.each(["update", "rollback", "crashed"] as const)(
     }
   }
 );
+
+async function heldStart() {
+  const h = await installed(first, releases.url);
+  await configure(h.home, { holdStart: true });
+  const child = h.start();
+  const held = await child.line(/^fixture start held · /);
+  const url = string({ min: 1 }).parse(held.split(" · ")[1]);
+
+  return { h, child, url };
+}
+
+// The kit may already have closed the listener. Releasing a still-open gate also lets a broken guard finish,
+// exposing its erroneous ready line instead of turning this regression into a timeout.
+async function releaseStart(url: string) {
+  await fetch(new URL("/gate", url), { method: "POST" }).catch(() => undefined);
+}
+
+const startupClose = object({ event: literal("close"), serving: literal(false) });
+
+test("SIGTERM during held start closes without ready or a serving record, exits zero and releases the lock", async () => {
+  const { h, child, url } = await heldStart();
+
+  try {
+    expect(child.child.kill("SIGTERM")).toBe(true);
+    // This fixture's observer acknowledges signal delivery, not a delay guessed to be long enough.
+    await child.line(/^fixture stop noticed$/);
+    await releaseStart(url);
+    const result = await child.finished;
+
+    expect(result.code).toBe(0);
+    expect(result.signal).toBeNull();
+    expect(result.out).not.toMatch(/^notebook ready/m);
+    expect(await records(join(h.home, "events.jsonl"), startupClose)).toStrictEqual([
+      { event: "close", serving: false },
+    ]);
+    expect(existsSync(join(h.home, "serving.json"))).toBe(false);
+    expect(running(h.home)).toBe(false);
+    expect((await h.run(["seed", "after-stop", "store closed"])).code).toBe(0);
+  } finally {
+    await child.stop("SIGKILL");
+  }
+});
+
+test("an app update during held start closes without first publishing ready or a serving record", async () => {
+  const { h, child, url } = await heldStart();
+
+  try {
+    const requested = await fetch(new URL("/stop-start", url), { method: "POST" });
+    expect(await requested.text()).toBe("update requested");
+    await releaseStart(url);
+    await child.line(/^fixture held start closed$/);
+    // update() may reexecute immediately: only the stopped invocation's output and close are judged here.
+    const beforeRestart = child.output().split("fixture held start closed")[0];
+
+    expect(beforeRestart).not.toMatch(/^notebook ready/m);
+    const closed = await records(join(h.home, "events.jsonl"), startupClose);
+    expect(closed[0]).toStrictEqual({ event: "close", serving: false });
+  } finally {
+    await child.stop("SIGKILL");
+  }
+});
+
+test("a boot-check mark for another home cannot suppress real work and is hidden from serve and start, including checks", async () => {
+  const h = await installed(first, releases.url);
+  const stray = await directory();
+  const environmentProof = join(h.base, "environment.jsonl");
+  const startProof = join(h.base, "started.jsonl");
+  const work = await provider();
+  await configure(h.home, { environmentProof, startProof, startProvider: work.url });
+  const child = h.start({ SLOPKIT_BOOT_CHECK: stray });
+
+  const observation = object({
+    phase: literal("serve", "start"),
+    version: string(),
+    home: string(),
+    mark: nullable(string()),
+    contextMark: nullable(string()),
+  });
+
+  try {
+    await child.line(/^notebook ready/);
+    expect(work.calls).toStrictEqual([{ version: VERSION_ONE, home: h.home }]);
+    expect(await records(startProof, startRecord)).toStrictEqual([
+      { version: VERSION_ONE, home: h.home },
+    ]);
+    expect(await records(environmentProof, observation)).toStrictEqual([
+      { phase: "serve", version: VERSION_ONE, home: h.home, mark: null, contextMark: null },
+      { phase: "start", version: VERSION_ONE, home: h.home, mark: null, contextMark: null },
+    ]);
+    expect((await child.stop()).code).toBe(0);
+    expect((await h.run(["update", VERSION_TWO], { SLOPKIT_BOOT_CHECK: stray })).code).toBe(0);
+    const observations = await records(environmentProof, observation);
+
+    expect(observations).toHaveLength(3);
+    expect(observations[2]).toMatchObject({
+      phase: "serve",
+      version: VERSION_TWO,
+      mark: null,
+      contextMark: null,
+    });
+    expect(observations[2]?.home).not.toBe(h.home);
+    expect(work.calls).toStrictEqual([{ version: VERSION_ONE, home: h.home }]);
+    expect(await records(startProof, startRecord)).toStrictEqual([
+      { version: VERSION_ONE, home: h.home },
+    ]);
+  } finally {
+    await child.stop();
+    await work.close();
+  }
+});
