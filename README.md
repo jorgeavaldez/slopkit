@@ -261,7 +261,9 @@ process.exitCode = await runCli(process.argv.slice(2), {
   name: "notes", root: new URL("../", import.meta.url), schema: schemaVersion(SCHEMA), serves: "your notes.",
   serve: async ({ home, version, log, web, env }) => {
     /* open the store, serveSync when web isn't off */
-    return { url, close };
+    // `start` starts the app's own work (schedules, jobs, listeners of its own; outside calls run as jobs, never
+    // awaited here): a release's boot check on copies of the home never runs it.
+    return { url, start: () => app.start(), close };
   },
 });
 ```

@@ -274,6 +274,16 @@ function decodeCookie(value: string | undefined): string | undefined {
  * A path on this server to return to, or nothing: never another origin (`//host`, `/\\host`, a scheme), and only
  * printable ASCII, which a Location header always takes (the redirect to the login percent-encodes the rest).
  */
+/**
+ * A request's target read as a path on this server: origin-form only (one `/`, then the path and query), never `//host`
+ * or an absolute URL, which a URL parser would read as another host's path. Undefined for any other target.
+ */
+function targetOf(raw: string | undefined): URL | undefined {
+  return raw !== undefined && raw.startsWith("/") && !raw.startsWith("//")
+    ? new URL(`http://localhost${raw}`)
+    : undefined;
+}
+
 function onThisServer(path: string | null | undefined): string | undefined {
   return path !== null &&
     path !== undefined &&
@@ -734,7 +744,12 @@ export async function serveWeb(
         return send(request, response, 421, "Unknown host");
       }
 
-      const url = new URL(request.url ?? "/", "http://localhost");
+      const url = targetOf(request.url);
+
+      if (url === undefined) {
+        return send(request, response, 400, "Bad request target");
+      }
+
       const https = config.host?.https === true && header(request, "host") === config.host.name;
       const secure = header(request, "host") === plainHost ? "" : " Secure;";
       const callback = `${https ? "https" : "http"}://${header(request, "host") ?? ""}/auth/callback`;
@@ -889,10 +904,13 @@ export async function serveWeb(
         return refuse(421);
       }
 
-      if (
-        options.socket === undefined ||
-        new URL(request.url ?? "/", "http://localhost").pathname !== options.socket.path
-      ) {
+      const target = targetOf(request.url);
+
+      if (target === undefined) {
+        return refuse(400);
+      }
+
+      if (options.socket === undefined || target.pathname !== options.socket.path) {
         return refuse(404);
       }
 

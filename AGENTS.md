@@ -58,7 +58,8 @@ or the kit's own tests in `test/`.
   own copy before it paints, and checks the cookie before every pull and push and on every tick; every pull and push
   carries `as`, and `syncRoutes` refuses one for another person's copy before anything acts.
 - Nothing replaces a release that hasn't started on the home's data (`server/cli`): an update installs aside and boots
-  on copies of the store and settings first; each install keeps the one it replaced; a rollback never crosses a
+  on copies of the store and settings first, serving without the app's own work (`start`), so a check acts on nothing
+  outside the copies; each install keeps the one it replaced; a rollback never crosses a
   migration without the store copy from before it; an automatic rollback only undoes an update that never proved
   itself, never back and forth.
 - Every untrusted boundary is checked by a schema (`schema`); nothing is coerced. Money is safe-integer minor units.

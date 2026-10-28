@@ -61,6 +61,13 @@ import type { Logger } from "./log.ts";
 
 const INSTALL_TIMEOUT_MS = 10 * 60_000;
 const CHECK_TIMEOUT_MS = 60_000;
+
+/**
+ * Set in a boot check's environment to the scratch home it serves, read only by the kit's `serve` and taken out of the
+ * process's environment before the app runs: on that home the release opens the copies and serves, and its `start`
+ * (the app's own work) never runs. On any other home it means nothing.
+ */
+const BOOT_CHECK = "SLOPKIT_BOOT_CHECK";
 const LOCK_WAIT_MS = 1000;
 
 /** A release that has stayed up this long in one server on a home is proven: a crash loop after it isn't its update's. */
@@ -406,7 +413,12 @@ async function bootCheck(
 
     const child = spawn(process.execPath, [entry(root, app.name), "serve"], {
       // Nothing of the real home, credentials or providers reaches the check.
-      env: { PATH: process.env.PATH, HOME: scratch, [`${upper(app.name)}_HOME`]: scratch },
+      env: {
+        PATH: process.env.PATH,
+        HOME: scratch,
+        [`${upper(app.name)}_HOME`]: scratch,
+        [BOOT_CHECK]: scratch,
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
 
@@ -1497,6 +1509,13 @@ export type ServeContext = {
 export type Served = {
   /** Its web server's address, when it has one. */
   url?: string;
+  /**
+   * Starts the app's own work: its schedules and due jobs, and listeners of its own. Called once the app serves, before
+   * the ready line; a boot check (`update`, `rollback`) never calls it, so a release checked on copies of the home acts
+   * on nothing outside them. It only starts work: a call to an outside service runs as a job whose failure is a state,
+   * never awaited here, since a `start` that throws keeps the server from starting.
+   */
+  start: () => void | Promise<void>;
   close: () => Promise<void>;
   /** The asked update job, claimed running before anything stops (`beginUpdate`). */
   claim?: () => { id: number; release: string } | undefined;
@@ -1538,7 +1557,12 @@ function reexecute(): Promise<never> {
   });
 }
 
-async function serve(app: Package, options: CliOptions, home: string): Promise<number> {
+async function serve(
+  app: Package,
+  options: CliOptions,
+  home: string,
+  checking: boolean
+): Promise<number> {
   const owner = lock(home);
 
   if (owner === undefined) {
@@ -1586,6 +1610,38 @@ async function serve(app: Package, options: CliOptions, home: string): Promise<n
     env: app.env,
     update: () => stop?.({ reason: "update", update: true }),
   });
+
+  if (checking) {
+    say("info", "boot check: the app's own work isn't started");
+  }
+
+  // An app built without types can hand back no `start`: it has none to run, as before `start` existed.
+  if (!checking && "start" in served) {
+    try {
+      // A stop while it starts is a stop: nothing says ready after it.
+      const early = await Promise.race([
+        Promise.resolve(served.start()).then(() => undefined),
+        stopped,
+      ]);
+
+      if (early !== undefined) {
+        say("info", "stopping before ready", { reason: early.reason });
+        await served.close();
+        owner.close();
+        await log.flushed();
+
+        return early.update ? await reexecute() : 0;
+      }
+    } catch (error) {
+      say("error", "the app's work didn't start", { reason: reason(error) });
+      console.error(`${app.name} didn't start: ${reason(error)}`);
+      await served.close().catch(() => undefined);
+      owner.close();
+      await log.flushed();
+
+      return 1;
+    }
+  }
 
   say("info", "started", { pid: process.pid, version: app.version, web: served.url ?? null });
   const serving = join(home, "serving.json");
@@ -2138,7 +2194,11 @@ export async function runCli(args: readonly string[], options: CliOptions): Prom
   }
 
   const root = typeof options.root === "string" ? options.root : fileURLToPath(options.root);
-  const env = options.env ?? process.env;
+  const given = options.env ?? process.env;
+  const checked = given[BOOT_CHECK];
+  const env = Object.fromEntries(Object.entries(given).filter(([key]) => key !== BOOT_CHECK));
+  // oxlint-disable-next-line typescript/no-dynamic-delete -- the check's mark leaves the process before the app runs
+  delete process.env[BOOT_CHECK];
 
   const app: Package = {
     name: options.name,
@@ -2150,9 +2210,10 @@ export async function runCli(args: readonly string[], options: CliOptions): Prom
 
   const home = resolvePath(env[`${upper(app.name)}_HOME`] ?? join(homedir(), `.${app.name}`));
   const [command = "serve", ...rest] = args;
+  const checking = checked !== undefined && checked !== "" && resolvePath(checked) === home;
 
   if (command === "serve" && rest.length === 0) {
-    return await serve(app, options, home);
+    return await serve(app, options, home, checking);
   }
 
   if (
