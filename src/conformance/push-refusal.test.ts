@@ -169,15 +169,18 @@ async function server(bodyLimit?: number) {
   });
 
   cleanups.push(web.close);
-  let login = await fetch(new URL("auth/login", web.url), { redirect: "manual" });
-  login = await fetch(login.headers.get("location") ?? "", { redirect: "manual" });
-  login = await fetch(login.headers.get("location") ?? "", { redirect: "manual" });
+  const headers = { cookie: "", origin: new URL(web.url).origin };
 
-  const headers = {
-    cookie: (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "",
-    origin: new URL(web.url).origin,
+  const signIn = async () => {
+    let login = await fetch(new URL("auth/login", web.url), { redirect: "manual" });
+    login = await fetch(login.headers.get("location") ?? "", { redirect: "manual" });
+    login = await fetch(login.headers.get("location") ?? "", { redirect: "manual" });
+    expect(login.status).toBe(302);
+    headers.cookie = (login.headers.get("set-cookie") ?? "").split(";")[0] ?? "";
+    expect(headers.cookie).toMatch(/^conformance=./);
   };
 
+  await signIn();
   const options = { base: web.url.replace(/\/$/, ""), headers };
   const pulls: { client: string; id: number }[][] = [];
 
@@ -213,6 +216,7 @@ async function server(bodyLimit?: number) {
     network,
     pulls,
     act,
+    signIn,
     echoCalls: () => echoCalls,
     refuse: (kind: "forbidden" | "conflict") => {
       refuse = kind;
@@ -597,6 +601,111 @@ test("an envelope 400 restores queued intent and reload with a matching contract
   ]);
 });
 
+/** The first command acted before its reply was lost; the second has never been sent. */
+async function signedOutPush() {
+  const peer = await server();
+  await peer.act("page", 1, 10);
+
+  const logout = await fetch(new URL("auth/logout", peer.web.url), {
+    method: "POST",
+    headers: peer.headers,
+  });
+
+  expect(logout.status).toBe(204);
+  const sent: { client: string; ids: number[] }[] = [];
+
+  const commands: Pending<Command, Outcome>[] = [
+    { ...queued(1, 10), state: { kind: "unknown", failure: "earlier reply lost" } },
+    queued(2, 20),
+  ];
+
+  const network: Network = {
+    ...peer.network,
+    // Hold the earlier receipt until after sign-in, so this test challenges the refused push, not reconciliation.
+    pull: async (input) => {
+      const result = await peer.network.pull(input);
+
+      return result.ok ? { ok: true, value: { ...result.value, receipts: [] } } : result;
+    },
+    push: async (input) => {
+      sent.push({ client: input.client, ids: input.commands.map((each) => each.id) });
+      const result = await peer.network.push(input);
+      expect(result).toMatchObject({
+        ok: false,
+        failure: { kind: "signed-out", refused: true },
+      });
+
+      return result;
+    },
+  };
+
+  const app = await launch(network, commands);
+
+  return { peer, app, sent };
+}
+
+test("a kit signed-out push restores queued intent and prior uncertainty, and stops pushing", async () => {
+  const { peer, app, sent } = await signedOutPush();
+
+  expect(app.runtime.model().connection.kind).toBe("signed-out");
+  expect
+    .soft(app.runtime.model().commands.map((each) => each.state))
+    .toStrictEqual([{ kind: "unknown", failure: "earlier reply lost" }, { kind: "queued" }]);
+  await advance(app, POLL_MS * 10);
+  expect(app.runtime.model().connection.kind).toBe("signed-out");
+  expect(sent).toStrictEqual([{ client: "page", ids: [1, 2] }]);
+  expect(app.answers).toStrictEqual([]);
+  expect(peer.effects()).toStrictEqual([["r1", 10, 2]]);
+  expect(app.runtime.faults).toStrictEqual([]);
+});
+
+test("a kit signed-out push puts queued intent back on disk; sign-in and reload resend the same keys once", async () => {
+  const { peer, app, sent } = await signedOutPush();
+  const reopened = database({ factory: app.stored.factory, name: app.stored.name });
+  const disk = await reopened.port.load();
+
+  // A queued command's in-flight mark must be cleared before a reload can mistake it for a lost outcome.
+  expect.soft(disk.commands.find((each) => each.id === 2)?.state).toStrictEqual({ kind: "queued" });
+  await peer.signIn();
+
+  const reloaded = await launch(
+    {
+      ...peer.network,
+      pull: async (input) => {
+        const result = await peer.network.pull(input);
+
+        return result.ok ? { ok: true, value: { ...result.value, receipts: [] } } : result;
+      },
+      push: (input) => {
+        sent.push({ client: input.client, ids: input.commands.map((each) => each.id) });
+
+        return peer.network.push(input);
+      },
+    },
+    [],
+    reopened
+  );
+
+  expect(sent).toStrictEqual([
+    { client: "page", ids: [1, 2] },
+    { client: "page", ids: [1, 2] },
+  ]);
+  expect(reloaded.runtime.model().commands.map((each) => each.state)).toStrictEqual([
+    { kind: "done", outcome: { kind: "ok", resource: "r1" }, revision: 2 },
+    { kind: "done", outcome: { kind: "ok", resource: "r2" }, revision: 3 },
+  ]);
+  expect((await reopened.port.load()).commands.map((each) => each.state)).toStrictEqual([
+    { kind: "done", outcome: { kind: "ok", resource: "r1" }, revision: 2 },
+    { kind: "done", outcome: { kind: "ok", resource: "r2" }, revision: 3 },
+  ]);
+  expect(peer.effects()).toStrictEqual([
+    ["r1", 10, 2],
+    ["r2", 20, 3],
+  ]);
+  expect(reloaded.answers.map((each) => each.id)).toStrictEqual([1, 2]);
+  expect(reloaded.runtime.faults).toStrictEqual([]);
+});
+
 test("an unreadable 200 is unknown and incompatible; reload replays the original ledger receipt", async () => {
   const peer = await server();
 
@@ -716,6 +825,8 @@ async function intermediary(
 }
 
 test.each([
+  { status: 401, body: "<html>proxy denied</html>", type: "text/html" },
+  { status: 401, body: '{"message":"proxy denied"}', type: "application/json" },
   { status: 403, body: "<html>proxy denied</html>", type: "text/html" },
   { status: 409, body: "<html>proxy denied</html>", type: "text/html" },
   { status: 403, body: '{"message":"proxy denied"}', type: "application/json" },
@@ -730,7 +841,7 @@ test.each([
     const result = await call(echo, { text: "probe" }, options);
     expect(result).toMatchObject({
       ok: false,
-      failure: { kind: status === 403 ? "forbidden" : "conflict" },
+      failure: { kind: status === 401 ? "signed-out" : status === 403 ? "forbidden" : "conflict" },
     });
 
     const app = await launch(
@@ -743,6 +854,8 @@ test.each([
 
     expect(app.runtime.model().commands[0]?.state.kind).toBe("unknown");
     expect(app.answers).toStrictEqual([]);
+
+    expect(app.runtime.model().connection.kind).toBe(status === 401 ? "signed-out" : "offline");
   }
 );
 
@@ -809,6 +922,18 @@ test("a successful HTML login page is signed-out, not an unreadable origin reply
     ok: false,
     failure: { kind: "signed-out" },
   });
+
+  const app = await launch(
+    {
+      pull: async () => ({ ok: true, value: { patch: patch(1, [], true), receipts: [] } }),
+      push: (input) => call(pushEndpoint, input, options),
+    },
+    [queued(1, 10)]
+  );
+
+  expect(app.runtime.model().commands[0]?.state.kind).toBe("unknown");
+  expect(app.runtime.model().connection.kind).toBe("signed-out");
+  expect(app.answers).toStrictEqual([]);
 });
 
 test("split UTF-8 reaches the handler intact", async () => {
