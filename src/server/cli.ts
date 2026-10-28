@@ -128,8 +128,10 @@ type Package = {
   /** The installed package's directory. */
   root: string;
   version: string;
-  /** The store's file in a home. */
+  /** The store: where the app keeps it (`CliOptions.store`), or the kit's place in a home it boot-checks. */
   store: string;
+  /** The store's file name in a home: `<name>.sqlite`, where the store sits by default and in a boot check. */
+  file: string;
   env: Readonly<Record<string, string | undefined>>;
 };
 
@@ -374,13 +376,13 @@ async function bootCheck(
   const scratch = await mkdtemp(join(tmpdir(), `${app.name}-check-`));
 
   try {
-    const source = store ?? (home === undefined ? undefined : join(home, app.store));
+    const source = store ?? (home === undefined ? undefined : app.store);
 
     if (source !== undefined && existsSync(source)) {
       const db = new DatabaseSync(source, { readOnly: true });
 
       try {
-        db.prepare("vacuum into ?").run(join(scratch, app.store));
+        db.prepare("vacuum into ?").run(join(scratch, app.file));
       } finally {
         db.close();
       }
@@ -696,6 +698,10 @@ async function install(
       return staged;
     }
 
+    if (home !== undefined && options.store === undefined && !existsSync(app.store)) {
+      output(`no store at ${app.store}: it's checked on an empty one`);
+    }
+
     const checked = await bootCheck(app, packageUnder(stage, app.name), home, options.store);
 
     if (!checked.ok) {
@@ -952,7 +958,7 @@ async function reinstallPrevious(
         : {
             store: copy,
             beforeReplace: () => {
-              swap = swapStore(join(home, app.store), copy);
+              swap = swapStore(app.store, copy);
             },
           }),
     });
@@ -1060,7 +1066,7 @@ async function runCrashed(app: Package, schema: number, home: string): Promise<n
       return await decline(`the kept release is ${app.version} itself`);
     }
 
-    const path = join(home, app.store);
+    const path = app.store;
     const crossing = target.schema < storeSchema(path);
     const copy = `${path}.schema-${target.schema}.bak`;
 
@@ -1219,7 +1225,7 @@ async function runRollback(
   try {
     // Whether it can open this store comes first: a refusal changes nothing, wherever the app runs from.
     const kept = keptPrevious(home);
-    const path = join(home, app.store);
+    const path = app.store;
     const now = storeSchema(path);
     const target = kept.info?.schema;
     const crossing = target === undefined || target < now;
@@ -1234,7 +1240,7 @@ async function runRollback(
       const back =
         copy !== undefined && existsSync(copy)
           ? `\n\`${app.name} rollback --with-store\` puts back ${basename(copy)} (from ${statSync(copy).mtime.toISOString()}), the store from before that migration: everything since is set aside.`
-          : `\nNo copy of the store from before that migration is kept here (${app.store}.schema-<n>.bak), so --with-store can't help.`;
+          : `\nNo copy of the store from before that migration is kept here (${basename(app.store)}.schema-<n>.bak), so --with-store can't help.`;
 
       console.error(`Rollback refused: ${what}.${back}`);
 
@@ -1243,7 +1249,7 @@ async function runRollback(
 
     if (crossing && (copy === undefined || !existsSync(copy))) {
       console.error(
-        `Rollback refused: no ${copy === undefined ? `${app.store}.schema-<n>.bak` : basename(copy)} to restore with it.`
+        `Rollback refused: no ${copy === undefined ? `${basename(app.store)}.schema-<n>.bak` : basename(copy)} to restore with it.`
       );
 
       return 1;
@@ -1501,6 +1507,11 @@ export type ServeContext = {
   /** `web.json`, or why the web is off. */
   web: WebConfig | { off: string };
   env: Readonly<Record<string, string | undefined>>;
+  /**
+   * The store's path: open the store here. It's where `CliOptions.store` says, or the kit's own place in a home a
+   * release is boot-checked on, holding the copy the check runs on.
+   */
+  store: string;
   /** Stop the server for the update the app's store has asked (`askUpdate`), then start the same command again. */
   update: () => void;
 };
@@ -1528,6 +1539,13 @@ export type CliOptions = {
   root: URL | string;
   /** The store schema this release writes (`schemaVersion`). */
   schema: number;
+  /**
+   * Where the app keeps its store, from the home and environment it runs with (default `<home>/<name>.sqlite`; a
+   * relative path is taken from the home).
+   * `update`, `rollback` and an update asked from a page check, back up and restore the store here, and `serve` gets
+   * the same path as `store`.
+   */
+  store?: (place: { home: string; env: Readonly<Record<string, string | undefined>> }) => string;
   /** What `serve` does, for the help: "<name> serve: Run the server on the home: <serves>". */
   serves: string;
   serve: (context: ServeContext) => Promise<Served>;
@@ -1608,6 +1626,7 @@ async function serve(
     say,
     web,
     env: app.env,
+    store: app.store,
     update: () => stop?.({ reason: "update", update: true }),
   });
 
@@ -1727,7 +1746,7 @@ async function serve(
   }
 
   try {
-    finishUpdate(join(home, app.store), job.id, failed === null ? { installed: true } : { failed });
+    finishUpdate(app.store, job.id, failed === null ? { installed: true } : { failed });
   } catch (error) {
     // Left running: the next start settles it from the version it runs.
     say("warn", "couldn't record how the update ended", { job: job.id, reason: reason(error) });
@@ -2200,17 +2219,33 @@ export async function runCli(args: readonly string[], options: CliOptions): Prom
   // oxlint-disable-next-line typescript/no-dynamic-delete -- the check's mark leaves the process before the app runs
   delete process.env[BOOT_CHECK];
 
+  const home = resolvePath(
+    env[`${upper(options.name)}_HOME`] ?? join(homedir(), `.${options.name}`)
+  );
+
+  const [command = "serve", ...rest] = args;
+  const checking = checked !== undefined && checked !== "" && resolvePath(checked) === home;
+  const file = `${options.name}.sqlite`;
+  let store: string | undefined;
+
   const app: Package = {
     name: options.name,
     root,
     version: readManifest(root).version,
-    store: `${options.name}.sqlite`,
+    // Asked only by what uses the store: `version`, `probe` and the app's own commands run with whatever environment
+    // they're given (a release reports itself with none), so the app's answer is never needed there. A boot check's
+    // copy is at the kit's place in its scratch home, wherever the app keeps the store.
+    get store() {
+      store ??=
+        checking || options.store === undefined
+          ? join(home, file)
+          : resolvePath(home, options.store({ home, env }));
+
+      return store;
+    },
+    file,
     env,
   };
-
-  const home = resolvePath(env[`${upper(app.name)}_HOME`] ?? join(homedir(), `.${app.name}`));
-  const [command = "serve", ...rest] = args;
-  const checking = checked !== undefined && checked !== "" && resolvePath(checked) === home;
 
   if (command === "serve" && rest.length === 0) {
     return await serve(app, options, home, checking);
