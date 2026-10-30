@@ -1,7 +1,7 @@
 {
   "name": "slopkit",
-  "version": "0.4.0-rc.9",
-  "description": "Opinionated standards and libraries for fast, local-first personal software: state machines, exhaustive state tables, sync, a command ledger, jobs, a guarded server, and the conformance suite that proves them",
+  "version": "0.4.0",
+  "description": "Opinionated libraries for fast, local-first personal software: state machines, exhaustive state tables, sync, a command ledger, jobs, a guarded server, and the conformance suite that proves them",
   "keywords": [
     "conformance",
     "indexeddb",
@@ -20,7 +20,6 @@
   },
   "files": [
     "dist",
-    "RULES.md",
     "DEPS.md"
   ],
   "type": "module",

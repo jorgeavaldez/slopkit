@@ -86,7 +86,7 @@ export const tests = {
   "typescript/no-invalid-void-type": "off",
 } satisfies DummyRuleMap;
 
-/** Tests drive real stores and loopback services through public seams (`RULES.md`): vitest's mocking is refused. */
+/** Tests drive real stores and loopback services through public seams: vitest's mocking is refused. */
 export const noMocks = {
   name: "vitest",
   importNames: ["vi", "vitest"],

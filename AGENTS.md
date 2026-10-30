@@ -1,7 +1,7 @@
 # Working on slopkit
 
-`slopkit` is the kit its apps build on. `RULES.md` is the standard it meets as much as the apps do, and
-ships in the package. `README.md` covers the entries and their use, `DEPS.md` the dependencies and budgets.
+`slopkit` is the kit its apps build on. `README.md` covers the entries and their use, `DEPS.md` the
+dependencies and budgets.
 
 ## The kit's invariants
 
@@ -75,8 +75,8 @@ or the kit's own tests in `test/`.
 
 - `src/*.ts`: pure entries. `src/web/`: browser. `src/server/`: Node. `src/build/`: the page's build (Node, esbuild
   plugins). `src/test/`: the seeded network, the OIDC
-  stand-in and state table checks, for apps' tests. `src/conformance/`: the conformance suite, shipped so each app
-  runs it against the version it installs, with `pull.ts` (the server pull contract, run by each app on its own pull)
+  stand-in and state table checks, for apps' tests. `src/conformance/`: the conformance suite, shipped for apps to
+  run against the version they install, with `pull.ts` (the server pull contract, for an app to run on its own pull)
   and `legacy/` (released adapters, for cross-release checks).
 - `test/`: the kit's own regression tests, not shipped.
 - `scripts/pack-check.ts`: the packed-consumer check.
@@ -96,6 +96,6 @@ or the kit's own tests in `test/`.
   conformance cases.
 - The conformance suite's expected results come from the contract, never from the code's current answer.
 - No mocks: real stores, real entry points, loopback stand-ins, the seeded overlapping network.
-- Lint is ultracite's presets plus `src/lint.ts`, the rules every app shares (`slopkit/lint`), and the
+- Lint is ultracite's presets plus `src/lint.ts`, the rules the kit's lint preset ships (`slopkit/lint`), and the
   kit's own boundaries in `oxlint.config.ts`. A rule is off only with its reason beside it; a one-site exception is an
   `oxlint-disable-next-line` with its reason, and a type assertion states its checked invariant in a `SAFETY:` line.

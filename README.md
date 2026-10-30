@@ -1,6 +1,6 @@
 # slopkit
 
-opinionated standards and libraries for fast, local-first personal software.
+opinionated libraries for fast, local-first personal software.
 **proper slop deserves a decent bowl and a spoon.**
 
 ## what
@@ -9,8 +9,8 @@ a toolkit for writing software as a state machine: models, messages, effects. ev
 doesn't compile, errors say who acts and whether a call may have acted, and the server and page share one contract.
 includes sync, an indexeddb replica, a command ledger, durable jobs, oidc auth, sealed credentials, a guarded web
 server and logs, plus a conformance suite your app runs against the version it installs. outside systems are adapters,
-so tests run the real code headless, without mocks. [`RULES.md`](RULES.md) is the standard an app meets,
-[`DEPS.md`](DEPS.md) the dependencies and budgets.
+so tests run the real code headless, without mocks. [`DEPS.md`](DEPS.md) has the dependencies, the recommended
+pairings and the kit's own budget.
 
 ## usage
 
@@ -112,7 +112,7 @@ export default defineConfig({
 ```
 
 agents call your app with a key (`addKey(home, name)` from `slopkit/server/keys`, allowed as `key:<name>` in
-`web.allow`), never as the person. prove it in your own tests against your real server:
+`web.allow`), never as the person. `agentAccess` checks that against your real server:
 
 ```ts
 import { agentAccess, reads, refused } from "slopkit/test/agents";
@@ -167,8 +167,8 @@ route(pull, (request, caller) => pulls.pull(request, viewerOf(request, caller)).
 the page's pull request carries `page` (the engine fills it in; a request without it gets the old whole reply), and
 the copy's history is its own subject: place `deriveHistoryState(model)` (loading, none, partial, complete) and
 `deriveDurabilityState(model)` (the storage states) in two tables and compose both. partial is a claim beside the
-numbers, "history from <through>, loading older · held of total", and totals cover only `through` and above. run the
-pull contract against your own pull in your tests:
+numbers, "history from <through>, loading older · held of total", and totals cover only `through` and above.
+`pullConformance` runs the pull contract against your own pull:
 
 ```ts
 import { pullConformance } from "slopkit/conformance/pull";

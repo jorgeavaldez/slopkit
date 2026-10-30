@@ -1,7 +1,7 @@
 # Conformance suite
 
 The kit's contract as executable checks. The expected results come from the contract, never from what the code
-currently answers, and the suite ships with the package so every app runs it against the kit version it installs.
+currently answers, and the suite ships with the package so an app can run it against the kit version it installs.
 
 Run it here with `npm exec --no -- vitest --run src/conformance`; an app runs the built copy from its installed package
 (see the README). Run the type check too: `states.test.ts` and `push-refusal.test.ts` hold compile-time rejections.

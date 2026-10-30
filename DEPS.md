@@ -17,14 +17,16 @@ the browser or its install cost, its own dependencies and its maintenance status
 Written in the kit instead: schemas (reconsider valibot past ~300 lines), the IndexedDB wrapper, cron, the log, the
 seeded network's PRNG and scheduler.
 
-## Defaults for apps
+## What pairs with the kit
+
+What the kit is built and measured with, if you want the same.
 
 - **Browser:** `preact` (5.3 KB gzip). Nothing else: the page's state is one model through `update`
   (`slopkit/machine`), so `@preact/signals` (2.6 KB gzip more) holds nothing it doesn't.
 - **Build:** esbuild, with `slopkit/build/reasons`'s `dropReasons()` (a state table's reasons stay out of the page).
 - **Development:** oxlint on ultracite's presets (`core`, `vitest`, `anti-slop`) with the kit's `lint` rules; oxfmt;
   knip for unused files, exports and dependencies.
-- **Not blessed:** zod and TypeBox in the browser (size); `idb` and workbox (a few dozen lines replace them); routers
+- **Not needed:** zod and TypeBox in the browser (size); `idb` and workbox (a few dozen lines replace them); routers
   (the model holds the route); React and CSS frameworks; date libraries (`Intl` covers them); pino; Playwright (its own
   browser builds, not on every platform; binding checks drive the installed browser); Replicache (archived; its protocol is reimplemented); sqlite-wasm unless demonstrably better;
   fast-check unless shrinking proves needed.
@@ -38,9 +40,5 @@ seeded network's PRNG and scheduler.
   mark and owed reset 468, when sync work is under way, by the engine's own rule, 310, each person's own copy
   and outbox on a device, 379, a complete copy landing whole over a partial disk, 13, and a signed-out push putting its commands back, 3).
   `cron` and `web/lift` (lifting an earlier release's copy, about 520 on top of the core) are browser-safe but outside
-  the core; an app that ships one counts it in its own budget. The budget grows only with a new entry or guarantee, by
+  the core; an app that ships one pays for it on top. The budget grows only with a new entry or guarantee, by
   its measured size.
-- **Hello app** (preact, and `sync`, `client`, `web/replica`, `schema`, `contract`, `states`): ≤ 17 KB gzip
-  JS, gated by the app template once it exists.
-- **Every app**, by default: initial JS ≤ 25 KB gzip, CSS ≤ 4 KB gzip, service worker ≤ 2 KB gzip. An app may lower
-  these, never raise them silently.
