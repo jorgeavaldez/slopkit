@@ -176,7 +176,7 @@
     "./package.json": "./package.json"
   },
   "dependencies": {
-    "jose": "6.2.12",
+    "jose": "6.2.13",
     "ws": "8.22.0"
   },
   "devDependencies": {
