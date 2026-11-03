@@ -185,13 +185,13 @@
     "esbuild": "0.28.2",
     "fake-indexeddb": "6.2.6",
     "happy-dom": "21.0.4",
-    "knip": "6.42.1",
-    "oxfmt": "0.71.0",
-    "oxlint": "1.86.0",
-    "oxlint-tsgolint": "7.0.2004",
+    "knip": "6.44.0",
+    "oxfmt": "0.75.0",
+    "oxlint": "1.90.0",
+    "oxlint-tsgolint": "7.0.2005",
     "preact": "11.0.1",
     "typescript": "^7.0.2",
-    "ultracite": "8.0.1",
+    "ultracite": "8.1.0",
     "vitest": "4.1.11"
   },
   "peerDependencies": {
